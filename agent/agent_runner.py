@@ -1,30 +1,41 @@
 """
-Bedrock AgentCore Runner — Plan Mode.
+Prompt2Test Agent — built with AWS Strands SDK.
 
-Sends the user's prompt to Claude via Amazon Bedrock and returns a
-structured execution plan (steps the agent would take to author the test).
+Strands handles:
+  - Tool calling loop (LLM → tool → LLM → ...)
+  - MCP server connections (Playwright MCP, REST Client MCP)
+  - Session memory
+  - Streaming responses
 
-Phase 1: Plan Mode only — LLM generates the plan, no browser/MCP execution yet.
-Phase 2: Will wire in Playwright MCP and REST Client MCP for live execution.
+Phase 1 (Plan Mode):
+  - Agent receives a plain-English prompt
+  - Uses Claude claude-sonnet-4-5 via Bedrock to generate a structured test plan
+  - MCP tools are defined but not yet connected to live servers
+
+Phase 2 (Automate Mode):
+  - Playwright MCP server connected (headed browser, DEV only)
+  - REST Client MCP server connected
+  - Agent executes the plan step-by-step
 """
 
 import json
 import logging
+import os
 import uuid
 from typing import Any
 
-import boto3
-from botocore.exceptions import ClientError
+from strands import Agent
+from strands.models import BedrockModel
+from strands.tools.mcp import MCPClient
 
 logger = logging.getLogger(__name__)
 
-# System prompt that instructs Claude how to behave as a test authoring agent
-SYSTEM_PROMPT = """You are Prompt2Test, an AI test authoring agent that runs on Amazon Bedrock.
+SYSTEM_PROMPT = """You are Prompt2Test, an AI test authoring agent running on Amazon Bedrock AgentCore.
 
 Your job is to read a plain-English test description and produce a structured execution plan
 that a QA engineer can review before it is executed.
 
-The execution plan must be returned as a JSON object with this exact shape:
+Return the execution plan as a JSON object with this exact shape:
 {
   "summary": "<one-line summary of what is being tested>",
   "steps": [
@@ -34,7 +45,7 @@ The execution plan must be returned as a JSON object with this exact shape:
       "tool": "playwright | rest-client | ssm | secrets",
       "action": "<short action label shown in the UI>",
       "detail": "<full description of what this step does>",
-      "placeholder": "<any {{PLACEHOLDER}} values that need to be resolved from config>"
+      "placeholder": "<any {{PLACEHOLDER}} values resolved from config at runtime>"
     }
   ],
   "configNeeded": ["BASE_URL", "EXPECTED_PLAN"],
@@ -43,55 +54,108 @@ The execution plan must be returned as a JSON object with this exact shape:
 }
 
 Rules:
-- Always start with an SSM step to resolve BASE_URL and any env-specific config.
+- Always start with an SSM step to resolve BASE_URL and env-specific config.
 - Use Playwright MCP for UI interactions (navigate, click, assert on DOM).
 - Use REST Client MCP for API-level checks.
 - Use Secrets Manager tool when credentials are needed.
-- Wrap all environment-specific values in {{DOUBLE_BRACES}} so they resolve at runtime.
+- Wrap all environment-specific values in {{DOUBLE_BRACES}}.
 - Keep steps granular — one action per step.
-- Return ONLY the JSON object, no markdown, no explanation outside the JSON.
+- Return ONLY the JSON object, no markdown, no extra text.
 """
 
 
+def _build_model() -> BedrockModel:
+    """Create the Bedrock model used by the Strands agent."""
+    return BedrockModel(
+        model_id=os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5"),
+        region_name=os.environ.get("AWS_REGION", "us-east-1"),
+        max_tokens=2048,
+    )
+
+
+def _build_tools_phase1() -> list:
+    """
+    Phase 1 — Plan Mode tools only (no live MCP connections yet).
+    These are lightweight Python functions the agent can call during planning.
+    """
+    from strands import tool
+
+    @tool
+    def resolve_config(key: str) -> str:
+        """
+        Resolve a configuration value from SSM Parameter Store.
+        During plan mode, returns a placeholder so the QA can see what will be resolved at runtime.
+
+        Args:
+            key: The config key to resolve (e.g. BASE_URL, EXPECTED_PLAN)
+        """
+        return f"{{{{{key}}}}}"   # returns {{KEY}} as a placeholder
+
+    @tool
+    def resolve_secret(secret_name: str) -> str:
+        """
+        Resolve a secret from AWS Secrets Manager.
+        During plan mode, returns a masked placeholder.
+
+        Args:
+            secret_name: The secret name (e.g. ACCOUNT_PASSWORD)
+        """
+        return f"***{secret_name}***"
+
+    return [resolve_config, resolve_secret]
+
+
+def _build_mcp_tools_phase2() -> list:
+    """
+    Phase 2 — Connect to live MCP servers running as sidecars in the AgentCore container.
+    Called only in Automate mode.
+    """
+    playwright_endpoint = os.environ.get("PLAYWRIGHT_MCP_ENDPOINT", "http://localhost:3001")
+    rest_endpoint = os.environ.get("REST_CLIENT_MCP_ENDPOINT", "http://localhost:3002")
+
+    playwright_mcp = MCPClient(endpoint=playwright_endpoint, name="playwright")
+    rest_mcp = MCPClient(endpoint=rest_endpoint, name="rest-client")
+
+    return playwright_mcp.tools + rest_mcp.tools
+
+
 class AgentRunner:
-    """Invokes Claude via Bedrock to generate a test execution plan."""
+    """
+    Prompt2Test agent built on AWS Strands SDK.
+    Runs inside Amazon Bedrock AgentCore Runtime.
+    """
 
     def __init__(self, model_id: str, region: str):
         self.model_id = model_id
         self.region = region
-        self._client = None
-
-    @property
-    def client(self):
-        if self._client is None:
-            self._client = boto3.client("bedrock-runtime", region_name=self.region)
-        return self._client
+        # Override env vars so _build_model picks them up
+        os.environ["BEDROCK_MODEL_ID"] = model_id
+        os.environ["AWS_REGION"] = region
 
     def plan(self, prompt: str, session_id: str, team_id: str) -> dict[str, Any]:
         """
-        Generate a test execution plan from a plain-English prompt.
+        Plan Mode — generate a structured test execution plan using Strands agent.
 
         Returns:
-            {
-                "sessionId": str,
-                "mode": "plan",
-                "plan": { ... }   # structured execution plan from Claude
-            }
+            { "sessionId": str, "mode": "plan", "plan": { ... } }
         """
         if not session_id:
             session_id = str(uuid.uuid4())
 
-        logger.info(f"Generating plan | session={session_id} | team={team_id}")
+        logger.info(f"[plan] session={session_id} team={team_id} prompt={prompt[:80]}")
 
-        try:
-            raw = self._invoke_claude(prompt)
-            plan = self._parse_plan(raw)
-        except ClientError as e:
-            logger.error(f"Bedrock error: {e}")
-            raise
-        except json.JSONDecodeError as e:
-            logger.warning(f"Claude returned non-JSON — wrapping as raw text: {e}")
-            plan = {"summary": prompt, "steps": [], "raw": raw}
+        # Build Strands agent with Phase 1 tools
+        agent = Agent(
+            model=_build_model(),
+            system_prompt=SYSTEM_PROMPT,
+            tools=_build_tools_phase1(),
+        )
+
+        # Invoke the agent
+        response = agent(prompt)
+
+        # Parse the JSON plan from the agent's response
+        plan = self._parse_plan(str(response))
 
         return {
             "sessionId": session_id,
@@ -99,35 +163,21 @@ class AgentRunner:
             "plan": plan,
         }
 
-    def _invoke_claude(self, user_prompt: str) -> str:
-        """Call Bedrock InvokeModel with Claude messages API."""
-        payload = {
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 2048,
-            "system": SYSTEM_PROMPT,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": user_prompt,
-                }
-            ],
-        }
-
-        response = self.client.invoke_model(
-            modelId=self.model_id,
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps(payload),
-        )
-
-        body = json.loads(response["body"].read())
-        return body["content"][0]["text"]
+    def automate(self, plan: dict, session_id: str, team_id: str) -> dict[str, Any]:
+        """
+        Automate Mode — execute the plan using Playwright MCP + REST Client MCP.
+        Phase 2: not yet implemented.
+        """
+        raise NotImplementedError("Automate mode is Phase 2")
 
     def _parse_plan(self, raw: str) -> dict:
-        """Parse Claude's JSON response into a plan dict."""
-        # Claude may wrap JSON in markdown code fences — strip them
+        """Parse agent response — strip markdown fences if present."""
         text = raw.strip()
         if text.startswith("```"):
             lines = text.splitlines()
             text = "\n".join(lines[1:-1])
-        return json.loads(text)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            # Return raw text wrapped so the UI can still display it
+            return {"summary": "Plan generated", "raw": text, "steps": []}
