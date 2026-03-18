@@ -120,7 +120,8 @@ export class Prompt2TestAgentStack extends cdk.Stack {
       projectName: "prompt2test-agent-build",
       role: codeBuildRole,
       environment: {
-        buildImage: codebuild.LinuxBuildImage.STANDARD_7_0,
+        // ARM64 — AgentCore only supports arm64 architecture
+        buildImage: codebuild.LinuxArmBuildImage.AMAZON_LINUX_2_STANDARD_3_0,
         computeType: codebuild.ComputeType.SMALL,
         privileged: true, // Required for Docker builds
       },
