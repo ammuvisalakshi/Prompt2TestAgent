@@ -1,0 +1,40 @@
+# Prompt2Test Agent Configuration
+# These values are defaults — overridden by environment variables in Lambda/ECS.
+
+agent:
+  name: Prompt2Test
+  model_id: us.anthropic.claude-sonnet-4-5   # Bedrock cross-region inference profile
+  max_tokens: 2048
+  region: us-east-1
+
+# MCP tool endpoints (used in Phase 2 when running in ECS)
+mcp:
+  playwright:
+    endpoint: http://localhost:3001   # Playwright MCP sidecar (DEV only, headed browser)
+    headed: true
+    novnc_port: 6080
+  rest_client:
+    endpoint: http://localhost:3002   # REST Client MCP sidecar
+
+# Config store paths (SSM Parameter Store)
+ssm:
+  base_path: /prompt2test
+  # L1 — Team base:  /prompt2test/{team_id}/base/
+  # L2 — Service:    /prompt2test/{team_id}/{service}/
+  # L3 — Account:    /prompt2test/{team_id}/{service}/{account}/
+  # L4 — TC override: /prompt2test/{team_id}/{service}/{account}/{tc_id}/
+
+# Environment-specific IAM rules (enforced by CDK stack, documented here for reference)
+iam:
+  dev:
+    bedrock_invoke: allowed
+    playwright_headed: true
+  qa:
+    bedrock_invoke: denied     # IAM explicit deny
+    playwright_headed: false
+  uat:
+    bedrock_invoke: denied
+    playwright_headed: false
+  prod:
+    bedrock_invoke: denied
+    playwright_headed: false
