@@ -1,43 +1,82 @@
 import * as cdk from "aws-cdk-lib";
 import { Construct } from "constructs";
-import * as lambda from "aws-cdk-lib/aws-lambda";
-import * as apigateway from "aws-cdk-lib/aws-apigateway";
+import * as ecr from "aws-cdk-lib/aws-ecr";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as logs from "aws-cdk-lib/aws-logs";
-import * as path from "path";
 
 export class Prompt2TestAgentStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    // ── IAM Role for Lambda ──────────────────────────────────────────────
-    const lambdaRole = new iam.Role(this, "RouterLambdaRole", {
-      assumedBy: new iam.ServicePrincipal("lambda.amazonaws.com"),
-      managedPolicies: [
-        iam.ManagedPolicy.fromAwsManagedPolicyName(
-          "service-role/AWSLambdaBasicExecutionRole"
-        ),
+    // Image URI passed in from GitHub Actions via --context imageUri=...
+    const imageUri = this.node.tryGetContext("imageUri") as string | undefined;
+
+    // ── ECR Repository ───────────────────────────────────────────────────
+    // Stores Docker images built by GitHub Actions
+    const ecrRepo = new ecr.Repository(this, "AgentRepository", {
+      repositoryName: "prompt2test-agent",
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+      lifecycleRules: [
+        {
+          // Keep only last 5 images to save costs
+          maxImageCount: 5,
+          description: "Keep last 5 images",
+        },
       ],
+    });
+
+    // ── IAM Role for AgentCore ───────────────────────────────────────────
+    // AgentCore assumes this role when running the agent container
+    const agentRole = new iam.Role(this, "AgentCoreRole", {
+      roleName: "prompt2test-agentcore-role",
+      assumedBy: new iam.CompositePrincipal(
+        new iam.ServicePrincipal("bedrock.amazonaws.com"),
+        new iam.ServicePrincipal("ecs-tasks.amazonaws.com")
+      ),
+      description: "Role for Prompt2Test Bedrock AgentCore runtime",
       inlinePolicies: {
         BedrockInvoke: new iam.PolicyDocument({
           statements: [
+            // Allow Claude claude-sonnet-4-5 (DEV only — deny added for QA/UAT/PROD separately)
             new iam.PolicyStatement({
-              actions: ["bedrock:InvokeModel"],
-              // Allow Claude claude-sonnet-4-5 only (cross-region inference profile)
+              sid: "AllowBedrockInvoke",
+              actions: ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
               resources: [
                 `arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-4-5*`,
                 `arn:aws:bedrock:*:${this.account}:inference-profile/us.anthropic.claude-sonnet-4-5*`,
               ],
             }),
-            // SSM — read team config (Phase 2)
+            // Pull container image from ECR
             new iam.PolicyStatement({
+              sid: "AllowECRPull",
+              actions: [
+                "ecr:GetDownloadUrlForLayer",
+                "ecr:BatchGetImage",
+                "ecr:GetAuthorizationToken",
+              ],
+              resources: ["*"],
+            }),
+            // Write logs
+            new iam.PolicyStatement({
+              sid: "AllowLogs",
+              actions: [
+                "logs:CreateLogGroup",
+                "logs:CreateLogStream",
+                "logs:PutLogEvents",
+              ],
+              resources: ["*"],
+            }),
+            // SSM — read team config (4-level config store)
+            new iam.PolicyStatement({
+              sid: "AllowSSMRead",
               actions: ["ssm:GetParameter", "ssm:GetParametersByPath"],
               resources: [
                 `arn:aws:ssm:${this.region}:${this.account}:parameter/prompt2test/*`,
               ],
             }),
-            // Secrets Manager — read account credentials (Phase 2)
+            // Secrets Manager — account credentials
             new iam.PolicyStatement({
+              sid: "AllowSecretsRead",
               actions: ["secretsmanager:GetSecretValue"],
               resources: [
                 `arn:aws:secretsmanager:${this.region}:${this.account}:secret:prompt2test/*`,
@@ -48,66 +87,36 @@ export class Prompt2TestAgentStack extends cdk.Stack {
       },
     });
 
-    // ── Lambda — Router ──────────────────────────────────────────────────
-    const routerFn = new lambda.Function(this, "RouterFunction", {
-      functionName: "prompt2test-router",
-      runtime: lambda.Runtime.PYTHON_3_12,
-      handler: "lambda.router.handler.handler",
-      code: lambda.Code.fromAsset(path.join(__dirname, "../../"), {
-        exclude: [
-          "infra/**",
-          "scripts/**",
-          ".venv/**",
-          "**/__pycache__/**",
-          "*.md",
-          ".git/**",
-          "node_modules/**",
-        ],
-      }),
-      role: lambdaRole,
-      timeout: cdk.Duration.seconds(60),
-      memorySize: 512,
-      environment: {
-        BEDROCK_MODEL_ID: "us.anthropic.claude-sonnet-4-5",
-        ALLOWED_ORIGIN: "*", // Restrict to Amplify domain after deploy
-      },
-      logRetention: logs.RetentionDays.ONE_WEEK,
+    // ── CloudWatch Log Group ─────────────────────────────────────────────
+    const logGroup = new logs.LogGroup(this, "AgentLogGroup", {
+      logGroupName: "/prompt2test/agentcore",
+      retention: logs.RetentionDays.ONE_WEEK,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
-
-    // ── API Gateway ──────────────────────────────────────────────────────
-    const api = new apigateway.RestApi(this, "Prompt2TestApi", {
-      restApiName: "prompt2test-api",
-      description: "Prompt2Test — single Run API",
-      defaultCorsPreflightOptions: {
-        allowOrigins: apigateway.Cors.ALL_ORIGINS,
-        allowMethods: apigateway.Cors.ALL_METHODS,
-        allowHeaders: ["Content-Type", "Authorization"],
-      },
-      deployOptions: {
-        stageName: "dev",
-        throttlingRateLimit: 10,
-        throttlingBurstLimit: 20,
-      },
-    });
-
-    // POST /api/run
-    const apiResource = api.root.addResource("api");
-    const runResource = apiResource.addResource("run");
-    runResource.addMethod(
-      "POST",
-      new apigateway.LambdaIntegration(routerFn, {
-        timeout: cdk.Duration.seconds(29), // API GW max
-      })
-    );
 
     // ── Outputs ──────────────────────────────────────────────────────────
-    new cdk.CfnOutput(this, "ApiEndpoint", {
-      value: `${api.url}api/run`,
-      description: "POST /api/run endpoint — connect this to Prompt2TestUI",
+    new cdk.CfnOutput(this, "ECRRepositoryUri", {
+      value: ecrRepo.repositoryUri,
+      description: "ECR repository URI — used by GitHub Actions to push images",
+      exportName: "Prompt2TestAgentECRUri",
     });
 
-    new cdk.CfnOutput(this, "LambdaArn", {
-      value: routerFn.functionArn,
+    new cdk.CfnOutput(this, "AgentRoleArn", {
+      value: agentRole.roleArn,
+      description: "IAM role ARN for Bedrock AgentCore",
+      exportName: "Prompt2TestAgentRoleArn",
     });
+
+    new cdk.CfnOutput(this, "LogGroupName", {
+      value: logGroup.logGroupName,
+      description: "CloudWatch log group for agent runtime logs",
+    });
+
+    if (imageUri) {
+      new cdk.CfnOutput(this, "DeployedImageUri", {
+        value: imageUri,
+        description: "Currently deployed container image",
+      });
+    }
   }
 }

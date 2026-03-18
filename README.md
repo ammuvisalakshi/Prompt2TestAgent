@@ -1,70 +1,91 @@
 # Prompt2Test Agent — Backend
 
-AI-powered test authoring agent built on **Amazon Bedrock AgentCore Runtime**.
+AI-powered test authoring agent running on **Amazon Bedrock AgentCore Runtime**.
 
 ## Architecture
 
 ```
 UI (Prompt2TestUI)
-    │
-    ▼
-API Gateway  POST /api/run
-    │
-    ▼
-Lambda Router  (lambda/router/handler.py)
-    │
-    ├──► PLAN MODE  → Bedrock Agent Core Runtime
-    │                   ├── Claude claude-sonnet-4-6 (LLM reasoning)
-    │                   ├── Playwright MCP (headed browser · DEV only)
-    │                   └── REST Client MCP (external API calls)
-    │
-    └──► AUTOMATE MODE  → ECS Fargate (deterministic replay — Phase 2)
+      │
+      ▼
+Bedrock AgentCore Runtime   ← managed agent container
+      │
+      ├── Claude claude-sonnet-4-5 (LLM reasoning via Amazon Bedrock)
+      ├── Playwright MCP  (headed browser · DEV only · Phase 2)
+      └── REST Client MCP (external API calls · Phase 2)
 ```
 
-## What's Built Here
+## Deployment Flow
 
-| Folder | Purpose |
+```
+Push to GitHub (master)
+      ↓  GitHub Actions triggers automatically
+Build Docker image
+      ↓
+Push to Amazon ECR (container registry)
+      ↓
+CDK deploys ECR repo + IAM roles
+      ↓
+Agent is live on Bedrock AgentCore
+```
+
+## Project Structure
+
+| Path | Purpose |
 |---|---|
-| `lambda/router/` | Entry point — receives POST /api/run, routes to Plan or Automate |
-| `agent/` | Bedrock AgentCore runtime — LLM reasoning, session memory, tool routing |
-| `agent/tools/` | MCP tool implementations (Playwright, REST Client) |
-| `infra/` | AWS CDK stack — deploys Lambda, API Gateway, IAM roles |
-| `scripts/` | Deploy and test helper scripts |
+| `Dockerfile` | Agent container — Python 3.12 + FastAPI |
+| `agent/main.py` | AgentCore HTTP entry point (`POST /invoke`, `GET /health`) |
+| `agent/agent_runner.py` | Claude invocation — generates test execution plan |
+| `agent/tools/playwright_mcp.py` | Playwright MCP (Phase 2) |
+| `agent/tools/rest_client_mcp.py` | REST Client MCP (Phase 2) |
+| `agent/config/agent_config.yaml` | Agent + MCP + SSM config |
+| `.github/workflows/deploy.yml` | GitHub Actions CI/CD pipeline |
+| `infra/` | AWS CDK stack — ECR + IAM roles |
+| `scripts/test_local.py` | Local test without deploying |
 
 ## Build Phases
 
 ### Phase 1 — Plan Mode (Current)
-- User types a prompt in the UI chat
-- Lambda → Bedrock Claude claude-sonnet-4-6
-- Agent reasons and returns a structured execution plan
+- User types a prompt in the UI
+- AgentCore receives the request → calls Claude
+- Claude returns a structured execution plan
 - Plan displayed in the UI right panel
 
 ### Phase 2 — Automate Mode (Next)
 - Agent executes the plan using Playwright MCP
-- Results streamed back to UI
+- Results streamed back to the UI
 - Test case saved to DynamoDB
 
-## Tech Stack
+## Setup — GitHub Actions Secrets Required
 
-- **Runtime**: Python 3.12
-- **LLM**: Amazon Bedrock — Claude claude-sonnet-4-6
-- **Agent Runtime**: Amazon Bedrock AgentCore
-- **MCP Tools**: Playwright MCP, REST Client MCP
-- **Infrastructure**: AWS CDK (TypeScript)
-- **Entry Point**: AWS Lambda + API Gateway
+In your GitHub repo → **Settings → Secrets and variables → Actions**, add:
 
-## Local Setup
+| Secret | Value |
+|---|---|
+| `AWS_ACCESS_KEY_ID` | Your AWS access key |
+| `AWS_SECRET_ACCESS_KEY` | Your AWS secret key |
+
+## Local Development
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+
+# Run agent locally
+uvicorn agent.main:app --reload --port 8080
+
+# Test plan mode
+python scripts/test_local.py
 ```
 
-## Deploy
+## Deploy Infrastructure (first time only)
 
 ```bash
 cd infra
 npm install
+npx cdk bootstrap   # one-time setup per AWS account
 npx cdk deploy
 ```
+
+After that, every push to `master` auto-deploys via GitHub Actions.
