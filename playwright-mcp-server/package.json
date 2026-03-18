@@ -1,0 +1,16 @@
+{
+  "name": "prompt2test-playwright-mcp",
+  "version": "1.0.0",
+  "description": "Playwright MCP server for Prompt2Test — supports headed and headless Chromium",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@playwright/mcp": "latest"
+  },
+  "scripts": {
+    "start:headless": "playwright-mcp --port 3000 --browser chromium --headless",
+    "start:headed": "playwright-mcp --port 3000 --browser chromium"
+  }
+}
