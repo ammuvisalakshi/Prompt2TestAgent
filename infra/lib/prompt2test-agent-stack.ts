@@ -148,7 +148,7 @@ export class Prompt2TestAgentStack extends cdk.Stack {
     const buildOutput = new codepipeline.Artifact("BuildOutput");
 
     // GitHub connection ARN — created by CDK, authorized manually in console
-    const connectionArn = `arn:aws:codeconnections:${this.region}:${this.account}:connection/prompt2test-github`;
+    const connectionArn = `arn:aws:codeconnections:${this.region}:${this.account}:connection/b49882b2-aec0-4020-a219-fc3978a8cb89`;
 
     new codepipeline.Pipeline(this, "AgentPipeline", {
       pipelineName: "prompt2test-agent-pipeline",
