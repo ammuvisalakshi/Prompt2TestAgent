@@ -1,0 +1,51 @@
+# buildspec.yml — AWS CodeBuild instructions
+#
+# CodeBuild reads this file and runs these steps automatically
+# when CodePipeline pulls your code from GitHub.
+#
+# Flow:
+#   GitHub push → CodePipeline detects → CodeBuild runs this file
+#   → Docker image built → pushed to ECR → agent updated
+
+version: 0.2
+
+env:
+  variables:
+    AWS_DEFAULT_REGION: us-east-1
+    IMAGE_REPO_NAME: prompt2test-agent
+  exported-variables:
+    - IMAGE_URI
+
+phases:
+
+  pre_build:
+    commands:
+      - echo "=== Logging in to Amazon ECR ==="
+      - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+      - ECR_REGISTRY=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+      - IMAGE_TAG=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c1-8)
+      - IMAGE_URI=$ECR_REGISTRY/$IMAGE_REPO_NAME:$IMAGE_TAG
+      - echo "Image will be tagged as $IMAGE_URI"
+
+  build:
+    commands:
+      - echo "=== Building Docker image ==="
+      - docker build -t $IMAGE_URI -t $ECR_REGISTRY/$IMAGE_REPO_NAME:latest .
+      - echo "Build completed"
+
+  post_build:
+    commands:
+      - echo "=== Pushing image to ECR ==="
+      - docker push $IMAGE_URI
+      - docker push $ECR_REGISTRY/$IMAGE_REPO_NAME:latest
+      - echo "Push completed"
+      - echo "=== Writing image URI for CDK deploy ==="
+      - printf '{"imageUri":"%s"}' $IMAGE_URI > imageDetail.json
+      - cat imageDetail.json
+
+artifacts:
+  files:
+    - imageDetail.json
+    - infra/**/*
+    - buildspec.yml
