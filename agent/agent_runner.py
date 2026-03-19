@@ -158,7 +158,7 @@ class AgentRunner:
         os.environ["BEDROCK_MODEL_ID"] = model_id
         os.environ["AWS_REGION"] = region
 
-    def plan(self, prompt: str, session_id: str, team_id: str) -> dict[str, Any]:
+    def plan(self, prompt: str, session_id: str, team_id: str, conversation_history: str = "") -> dict[str, Any]:
         """
         Plan Mode — generate a structured test execution plan using Strands agent.
 
@@ -177,8 +177,14 @@ class AgentRunner:
             tools=_build_tools_phase1(),
         )
 
+        # Include conversation history so the agent has memory across turns
+        if conversation_history:
+            full_prompt = f"Conversation so far:\n{conversation_history}\n\nLatest message: {prompt}"
+        else:
+            full_prompt = prompt
+
         # Invoke the agent
-        response = agent(prompt)
+        response = agent(full_prompt)
 
         # Parse the JSON plan from the agent's response
         plan = self._parse_plan(str(response))
@@ -225,13 +231,24 @@ class AgentRunner:
         }
 
     def _parse_plan(self, raw: str) -> dict:
-        """Parse agent response — strip markdown fences if present."""
+        """Parse agent response — strip markdown fences, extract JSON if embedded in text."""
         text = raw.strip()
+        # Strip markdown fences
         if text.startswith("```"):
             lines = text.splitlines()
-            text = "\n".join(lines[1:-1])
+            text = "\n".join(lines[1:-1]).strip()
+        # Try direct parse
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            # Return raw text wrapped so the UI can still display it
-            return {"summary": "Plan generated", "raw": text, "steps": []}
+            pass
+        # Try extracting JSON block from mixed content (e.g. agent added conversational text)
+        start = text.find('{')
+        end = text.rfind('}')
+        if start != -1 and end > start:
+            try:
+                return json.loads(text[start:end + 1])
+            except json.JSONDecodeError:
+                pass
+        # Conversational response — return raw so UI can display it as chat
+        return {"summary": "Plan generated", "raw": text, "steps": []}

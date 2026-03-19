@@ -63,7 +63,12 @@ async def invocations(request: Request):
             region=os.environ.get("AWS_REGION", "us-east-1"),
         )
         if mode == "plan":
-            result = runner.plan(prompt=prompt, session_id=session_id, team_id=body.get("teamId", "default"))
+            result = runner.plan(
+                prompt=prompt,
+                session_id=session_id,
+                team_id=body.get("teamId", "default"),
+                conversation_history=body.get("conversationHistory", ""),
+            )
             return JSONResponse({"sessionId": result["sessionId"], "mode": "plan", "plan": result["plan"]})
         elif mode == "automate":
             plan = body.get("plan")
