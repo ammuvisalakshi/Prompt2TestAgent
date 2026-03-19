@@ -1,111 +1,81 @@
 """
 Bedrock AgentCore Runtime — HTTP entry point.
 
-Strands SDK powers the agent logic.
-AgentCore calls this container via HTTP:
-  POST /invoke  — agent invocation
-  GET  /health  — liveness check before routing traffic
+Diagnostic build: Strands SDK imports deferred to invocation time
+so startup errors don't silently crash the container.
 """
 
+import json
 import logging
 import os
+import traceback
 import uuid
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-
-from agent.agent_runner import AgentRunner
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Prompt2Test Agent (Strands SDK)", version="1.0.0")
+app = FastAPI(title="Prompt2Test Agent", version="1.0.0")
 
-# Initialise runner once at startup — reused across all requests
-runner = AgentRunner(
-    model_id=os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5"),
-    region=os.environ.get("AWS_REGION", "us-east-1"),
-)
-
-
-# ── Models ───────────────────────────────────────────────────────────────
-
-class InvokeRequest(BaseModel):
-    inputText: str                  # Plain-English test prompt from the UI
-    sessionId: str = ""             # Conversation session (managed by AgentCore)
-    mode: str = "plan"              # "plan" | "automate"
-    teamId: str = "default"        # From Cognito JWT (Phase 2)
-    plan: dict | None = None        # Required for automate mode — the plan to execute
-    sessionAttributes: dict = {}
-    promptSessionAttributes: dict = {}
-
-
-class InvokeResponse(BaseModel):
-    sessionId: str
-    mode: str
-    plan: dict | None = None        # Returned in plan mode
-    result: dict | None = None      # Returned in automate mode
-    error: str | None = None
-
-
-# ── Routes ───────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
-    """AgentCore health check — must return 200 for traffic routing."""
-    return {"status": "healthy", "agent": "Prompt2Test", "sdk": "strands-agents"}
+    return {"status": "healthy", "agent": "Prompt2Test"}
 
 
-@app.post("/invoke", response_model=InvokeResponse)
-async def invoke(request: InvokeRequest):
-    """Main agent invocation — called by Bedrock AgentCore."""
-    session_id = request.sessionId or str(uuid.uuid4())
-    prompt = request.inputText.strip()
-
-    if not prompt:
-        raise HTTPException(status_code=400, detail="inputText is required")
-
-    logger.info(f"invoke | mode={request.mode} | session={session_id} | prompt={prompt[:80]}")
+@app.post("/invoke")
+async def invoke(request: Request):
+    """Main agent invocation — imports Strands inside the handler to catch import errors."""
+    body_bytes = await request.body()
+    session_id = str(uuid.uuid4())
 
     try:
-        if request.mode == "plan":
-            result = runner.plan(
-                prompt=prompt,
-                session_id=session_id,
-                team_id=request.teamId,
-            )
-            return InvokeResponse(
-                sessionId=result["sessionId"],
-                mode="plan",
-                plan=result["plan"],
-            )
+        body = json.loads(body_bytes) if body_bytes else {}
+    except Exception:
+        body = {}
 
-        elif request.mode == "automate":
-            if not request.plan:
-                raise HTTPException(status_code=400, detail="plan is required for automate mode")
-            result = runner.automate(
-                plan=request.plan,
-                session_id=session_id,
-                team_id=request.teamId,
-            )
-            return InvokeResponse(
-                sessionId=result["sessionId"],
-                mode="automate",
-                result=result["result"],
-            )
+    logger.info(f"invoke called | path={request.url.path} | body_len={len(body_bytes)}")
+
+    mode = body.get("mode", "plan")
+    prompt = body.get("inputText", "").strip()
+    session_id = body.get("sessionId") or session_id
+
+    if not prompt:
+        return JSONResponse({"sessionId": session_id, "mode": mode, "error": "inputText is required"})
+
+    try:
+        from agent.agent_runner import AgentRunner
+
+        runner = AgentRunner(
+            model_id=os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5"),
+            region=os.environ.get("AWS_REGION", "us-east-1"),
+        )
+
+        if mode == "plan":
+            result = runner.plan(prompt=prompt, session_id=session_id, team_id=body.get("teamId", "default"))
+            return JSONResponse({"sessionId": result["sessionId"], "mode": "plan", "plan": result["plan"]})
+
+        elif mode == "automate":
+            plan = body.get("plan")
+            if not plan:
+                return JSONResponse({"sessionId": session_id, "mode": mode, "error": "plan is required for automate mode"})
+            result = runner.automate(plan=plan, session_id=session_id, team_id=body.get("teamId", "default"))
+            return JSONResponse({"sessionId": result["sessionId"], "mode": "automate", "result": result["result"]})
 
         else:
-            raise HTTPException(status_code=400, detail=f"Unknown mode: {request.mode}")
+            return JSONResponse({"sessionId": session_id, "mode": mode, "error": f"Unknown mode: {mode}"})
 
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.exception("Strands agent error")
-        return InvokeResponse(sessionId=session_id, mode=request.mode, error=str(e))
+        tb = traceback.format_exc()
+        logger.error(f"Agent error: {e}\n{tb}")
+        return JSONResponse({"sessionId": session_id, "mode": mode, "error": str(e), "traceback": tb})
 
 
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    logger.exception("Unhandled exception")
-    return JSONResponse(status_code=500, content={"error": str(exc)})
+# Catch-all: log any unexpected paths AgentCore might call
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+async def catch_all(path: str, request: Request):
+    body_bytes = await request.body()
+    logger.warning(f"UNEXPECTED PATH: {request.method} /{path} | body_len={len(body_bytes)}")
+    return JSONResponse({"error": f"Not found: {request.method} /{path}"}, status_code=404)
