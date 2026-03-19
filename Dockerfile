@@ -28,10 +28,10 @@ ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 
 # Bedrock AgentCore Runtime listens on port 8080
-EXPOSE 8080
+EXPOSE 8000
 
-# Health check — AgentCore pings /health before routing traffic
+# Health check — AgentCore pings /health
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
 
 CMD ["python", "agent/main.py"]
