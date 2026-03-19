@@ -26,7 +26,6 @@ from typing import Any
 
 from strands import Agent
 from strands.models import BedrockModel
-from strands.tools.mcp import MCPClient
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +137,8 @@ def _build_mcp_tools_phase2() -> list:
     Playwright MCP runs as a standalone ECS service behind an ALB.
     Called only in Automate mode.
     """
+    from strands.tools.mcp import MCPClient  # lazy import — avoids startup crash if SDK mismatch
+
     playwright_endpoint = os.environ.get(
         "PLAYWRIGHT_MCP_ENDPOINT",
         "http://localhost:3000"
