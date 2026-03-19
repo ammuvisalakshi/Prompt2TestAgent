@@ -30,6 +30,33 @@ from strands.tools.mcp import MCPClient
 
 logger = logging.getLogger(__name__)
 
+AUTOMATE_SYSTEM_PROMPT = """You are Prompt2Test, an AI test execution agent running on Amazon Bedrock AgentCore.
+
+You have access to Playwright MCP tools to control a real browser. Execute each step of the test plan
+exactly as described. After each step, report whether it succeeded or failed.
+
+Return results as a JSON object with this exact shape:
+{
+  "summary": "<one-line summary of test execution>",
+  "passed": true | false,
+  "steps": [
+    {
+      "stepNumber": 1,
+      "action": "<action label>",
+      "status": "passed | failed | skipped",
+      "detail": "<what happened>"
+    }
+  ],
+  "error": "<error message if overall test failed, else null>"
+}
+
+Rules:
+- Execute steps in order. Stop and mark as failed if a step throws an unrecoverable error.
+- Use playwright_navigate for navigation, playwright_click for clicks, playwright_fill for inputs.
+- Use playwright_get_visible_text or playwright_snapshot to verify assertions.
+- Return ONLY the JSON object, no markdown, no extra text.
+"""
+
 SYSTEM_PROMPT = """You are Prompt2Test, an AI test authoring agent running on Amazon Bedrock AgentCore.
 
 Your job is to read a plain-English test description and produce a structured execution plan
@@ -107,16 +134,19 @@ def _build_tools_phase1() -> list:
 
 def _build_mcp_tools_phase2() -> list:
     """
-    Phase 2 — Connect to live MCP servers running as sidecars in the AgentCore container.
+    Phase 2 — Connect to live MCP servers.
+    Playwright MCP runs as a standalone ECS service behind an ALB.
     Called only in Automate mode.
     """
-    playwright_endpoint = os.environ.get("PLAYWRIGHT_MCP_ENDPOINT", "http://localhost:3001")
-    rest_endpoint = os.environ.get("REST_CLIENT_MCP_ENDPOINT", "http://localhost:3002")
+    playwright_endpoint = os.environ.get(
+        "PLAYWRIGHT_MCP_ENDPOINT",
+        "http://localhost:3000"
+    )
+    # Strands MCPClient expects the SSE endpoint URL
+    sse_url = playwright_endpoint.rstrip("/") + "/sse"
 
-    playwright_mcp = MCPClient(endpoint=playwright_endpoint, name="playwright")
-    rest_mcp = MCPClient(endpoint=rest_endpoint, name="rest-client")
-
-    return playwright_mcp.tools + rest_mcp.tools
+    playwright_mcp = MCPClient(url=sse_url)
+    return playwright_mcp.tools
 
 
 class AgentRunner:
@@ -165,10 +195,38 @@ class AgentRunner:
 
     def automate(self, plan: dict, session_id: str, team_id: str) -> dict[str, Any]:
         """
-        Automate Mode — execute the plan using Playwright MCP + REST Client MCP.
-        Phase 2: not yet implemented.
+        Automate Mode — execute the plan using Playwright MCP.
+        Connects to the Playwright MCP server via PLAYWRIGHT_MCP_ENDPOINT env var.
         """
-        raise NotImplementedError("Automate mode is Phase 2")
+        if not session_id:
+            session_id = str(uuid.uuid4())
+
+        logger.info(f"[automate] session={session_id} team={team_id} steps={len(plan.get('steps', []))}")
+
+        steps_text = "\n".join([
+            f"Step {s['stepNumber']}: {s['action']} — {s['detail']}"
+            for s in plan.get("steps", [])
+        ])
+        prompt = (
+            f"Execute this test plan:\n\nSummary: {plan.get('summary', '')}\n\n"
+            f"Steps:\n{steps_text}"
+        )
+
+        tools = _build_mcp_tools_phase2()
+        agent = Agent(
+            model=_build_model(),
+            system_prompt=AUTOMATE_SYSTEM_PROMPT,
+            tools=tools,
+        )
+
+        response = agent(prompt)
+        result = self._parse_plan(str(response))
+
+        return {
+            "sessionId": session_id,
+            "mode": "automate",
+            "result": result,
+        }
 
     def _parse_plan(self, raw: str) -> dict:
         """Parse agent response — strip markdown fences if present."""

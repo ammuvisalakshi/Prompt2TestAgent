@@ -36,6 +36,7 @@ class InvokeRequest(BaseModel):
     sessionId: str = ""             # Conversation session (managed by AgentCore)
     mode: str = "plan"              # "plan" | "automate"
     teamId: str = "default"        # From Cognito JWT (Phase 2)
+    plan: dict | None = None        # Required for automate mode — the plan to execute
     sessionAttributes: dict = {}
     promptSessionAttributes: dict = {}
 
@@ -43,7 +44,8 @@ class InvokeRequest(BaseModel):
 class InvokeResponse(BaseModel):
     sessionId: str
     mode: str
-    plan: dict | None = None
+    plan: dict | None = None        # Returned in plan mode
+    result: dict | None = None      # Returned in automate mode
     error: str | None = None
 
 
@@ -80,7 +82,18 @@ async def invoke(request: InvokeRequest):
             )
 
         elif request.mode == "automate":
-            raise HTTPException(status_code=501, detail="Automate mode is Phase 2")
+            if not request.plan:
+                raise HTTPException(status_code=400, detail="plan is required for automate mode")
+            result = runner.automate(
+                plan=request.plan,
+                session_id=session_id,
+                team_id=request.teamId,
+            )
+            return InvokeResponse(
+                sessionId=result["sessionId"],
+                mode="automate",
+                result=result["result"],
+            )
 
         else:
             raise HTTPException(status_code=400, detail=f"Unknown mode: {request.mode}")
