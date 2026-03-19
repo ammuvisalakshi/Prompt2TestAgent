@@ -126,23 +126,20 @@ def _build_tools_phase1() -> list:
     return [resolve_config, resolve_secret]
 
 
-def _build_mcp_tools_phase2() -> list:
+def _build_mcp_client():
     """
-    Phase 2 — Connect to live MCP servers.
-    Playwright MCP runs as a standalone ECS service behind an ALB.
-    Called only in Automate mode.
+    Phase 2 — Return a connected MCPClient for the Playwright MCP server.
+    Must be used as a context manager: `with _build_mcp_client() as client:`
     """
     from strands.tools.mcp import MCPClient  # lazy import — avoids startup crash if SDK mismatch
+    from mcp.client.sse import sse_client
 
     playwright_endpoint = os.environ.get(
         "PLAYWRIGHT_MCP_ENDPOINT",
         "http://localhost:3000"
     )
-    # Strands MCPClient expects the SSE endpoint URL
     sse_url = playwright_endpoint.rstrip("/") + "/sse"
-
-    playwright_mcp = MCPClient(url=sse_url)
-    return playwright_mcp.tools
+    return MCPClient(lambda: sse_client(sse_url))
 
 
 class AgentRunner:
@@ -214,14 +211,15 @@ class AgentRunner:
             f"Steps:\n{steps_text}"
         )
 
-        tools = _build_mcp_tools_phase2()
-        agent = Agent(
-            model=_build_model(),
-            system_prompt=AUTOMATE_SYSTEM_PROMPT,
-            tools=tools,
-        )
+        with _build_mcp_client() as mcp:
+            tools = mcp.list_tools_sync()
+            agent = Agent(
+                model=_build_model(),
+                system_prompt=AUTOMATE_SYSTEM_PROMPT,
+                tools=tools,
+            )
+            response = agent(prompt)
 
-        response = agent(prompt)
         result = self._parse_plan(str(response))
 
         return {
