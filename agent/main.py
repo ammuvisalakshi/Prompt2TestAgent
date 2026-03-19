@@ -1,6 +1,10 @@
 """
 Bedrock AgentCore Runtime — HTTP entry point.
-Port 8000 (confirmed from working runtime logs).
+
+Official AgentCore protocol (bedrock-agentcore runtime):
+  POST /invocations  — agent invocation
+  GET  /ping         — health check
+  Port 8080 (default) — but confirmed working on 8000 from runtime logs
 """
 
 import json
@@ -17,19 +21,28 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Prompt2Test Agent", version="1.0.0")
 
-logger.info("Prompt2Test Agent starting on port 8000")
+logger.info("Prompt2Test Agent starting on port 8080")
 
 
+# ── Health check — AgentCore calls GET /ping ──────────────────────────────
+@app.get("/ping")
+def ping():
+    logger.info("GET /ping")
+    return {"status": "healthy"}
+
+
+# Keep /health as alias
 @app.get("/health")
 def health():
-    logger.info("Health check called")
-    return {"status": "healthy", "agent": "Prompt2Test"}
+    logger.info("GET /health")
+    return {"status": "healthy"}
 
 
-@app.post("/invoke")
-async def invoke(request: Request):
+# ── Main invocation — AgentCore calls POST /invocations ───────────────────
+@app.post("/invocations")
+async def invocations(request: Request):
     body_bytes = await request.body()
-    logger.info(f"POST /invoke body_len={len(body_bytes)}")
+    logger.info(f"POST /invocations body_len={len(body_bytes)}")
 
     try:
         body = json.loads(body_bytes) if body_bytes else {}
@@ -67,6 +80,13 @@ async def invoke(request: Request):
         return JSONResponse({"sessionId": session_id, "mode": mode, "error": str(e), "traceback": tb})
 
 
+# Keep /invoke as alias for backwards compatibility
+@app.post("/invoke")
+async def invoke(request: Request):
+    return await invocations(request)
+
+
+# Catch-all — log unexpected paths
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def catch_all(path: str, request: Request):
     body_bytes = await request.body()
