@@ -25,7 +25,6 @@ import uuid
 from typing import Any
 
 from strands import Agent
-from strands.models import BedrockModel
 
 logger = logging.getLogger(__name__)
 
@@ -90,13 +89,9 @@ Rules:
 """
 
 
-def _build_model() -> BedrockModel:
-    """Create the Bedrock model used by the Strands agent."""
-    return BedrockModel(
-        model_id=os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5"),
-        region_name=os.environ.get("AWS_REGION", "us-east-1"),
-        max_tokens=2048,
-    )
+def _build_model() -> str:
+    """Return the Bedrock model ID string for the Strands agent."""
+    return os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5")
 
 
 def _build_tools_phase1() -> list:
