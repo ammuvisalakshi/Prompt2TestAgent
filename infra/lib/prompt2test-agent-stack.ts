@@ -6,6 +6,7 @@ import * as logs from "aws-cdk-lib/aws-logs";
 import * as codebuild from "aws-cdk-lib/aws-codebuild";
 import * as codepipeline from "aws-cdk-lib/aws-codepipeline";
 import * as codepipeline_actions from "aws-cdk-lib/aws-codepipeline-actions";
+import * as cognito from "aws-cdk-lib/aws-cognito";
 
 export class Prompt2TestAgentStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -39,8 +40,8 @@ export class Prompt2TestAgentStack extends cdk.Stack {
               sid: "AllowBedrockInvoke",
               actions: ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
               resources: [
-                `arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-4-5*`,
-                `arn:aws:bedrock:*:${this.account}:inference-profile/us.anthropic.claude-sonnet-4-5*`,
+                `arn:aws:bedrock:*::foundation-model/anthropic.claude*`,
+                `arn:aws:bedrock:*:${this.account}:inference-profile/us.anthropic.claude*`,
               ],
             }),
             new iam.PolicyStatement({
@@ -183,7 +184,83 @@ export class Prompt2TestAgentStack extends cdk.Stack {
       ],
     });
 
+    // ── Cognito User Pool ─────────────────────────────────────────────────
+    const userPool = new cognito.UserPool(this, "UserPool", {
+      userPoolName: "prompt2test-users",
+      selfSignUpEnabled: false,
+      signInAliases: { email: true },
+      passwordPolicy: {
+        minLength: 8,
+        requireUppercase: true,
+        requireDigits: true,
+        requireSymbols: false,
+      },
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    const userPoolClient = new cognito.UserPoolClient(this, "UserPoolClient", {
+      userPool,
+      userPoolClientName: "prompt2test-web-client",
+      authFlows: { userPassword: true, userSrp: true },
+      generateSecret: false,
+    });
+
+    // ── Cognito Identity Pool ─────────────────────────────────────────────
+    const identityPool = new cognito.CfnIdentityPool(this, "IdentityPool", {
+      identityPoolName: "prompt2test_identity",
+      allowUnauthenticatedIdentities: false,
+      cognitoIdentityProviders: [{
+        clientId: userPoolClient.userPoolClientId,
+        providerName: userPool.userPoolProviderName,
+      }],
+    });
+
+    // IAM role for authenticated users — can invoke AgentCore
+    const authenticatedRole = new iam.Role(this, "CognitoAuthRole", {
+      assumedBy: new iam.FederatedPrincipal(
+        "cognito-identity.amazonaws.com",
+        {
+          StringEquals: { "cognito-identity.amazonaws.com:aud": identityPool.ref },
+          "ForAnyValue:StringLike": { "cognito-identity.amazonaws.com:amr": "authenticated" },
+        },
+        "sts:AssumeRoleWithWebIdentity"
+      ),
+      inlinePolicies: {
+        AgentCoreInvoke: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              actions: ["bedrock-agentcore:InvokeAgentRuntime"],
+              resources: [`arn:aws:bedrock-agentcore:${this.region}:${this.account}:runtime/Prompt2TestAgent-YTVbD4GrTi*`],
+            }),
+          ],
+        }),
+      },
+    });
+
+    new cognito.CfnIdentityPoolRoleAttachment(this, "IdentityPoolRoles", {
+      identityPoolId: identityPool.ref,
+      roles: { authenticated: authenticatedRole.roleArn },
+    });
+
     // ── Outputs ──────────────────────────────────────────────────────────
+    new cdk.CfnOutput(this, "UserPoolId", {
+      value: userPool.userPoolId,
+      description: "Cognito User Pool ID",
+      exportName: "Prompt2TestUserPoolId",
+    });
+
+    new cdk.CfnOutput(this, "UserPoolClientId", {
+      value: userPoolClient.userPoolClientId,
+      description: "Cognito User Pool Client ID",
+      exportName: "Prompt2TestUserPoolClientId",
+    });
+
+    new cdk.CfnOutput(this, "IdentityPoolId", {
+      value: identityPool.ref,
+      description: "Cognito Identity Pool ID",
+      exportName: "Prompt2TestIdentityPoolId",
+    });
+
     new cdk.CfnOutput(this, "ECRRepositoryUri", {
       value: ecrRepo.repositoryUri,
       description: "ECR repository — stores agent Docker images",
