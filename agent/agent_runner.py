@@ -135,6 +135,8 @@ def _build_mcp_client():
     Phase 2 — Return a connected MCPClient for the Playwright MCP server.
     Must be used as a context manager: `with _build_mcp_client() as client:`
     """
+    from urllib.parse import urlparse
+
     from strands.tools.mcp import MCPClient  # lazy import — avoids startup crash if SDK mismatch
     from mcp.client.sse import sse_client
 
@@ -143,7 +145,14 @@ def _build_mcp_client():
         "http://localhost:3000"
     )
     sse_url = playwright_endpoint.rstrip("/") + "/sse"
-    return MCPClient(lambda: sse_client(sse_url))
+
+    # playwright-mcp validates the Host header is localhost for CSRF protection.
+    # The ALB sends its own hostname, so we override it to localhost:<port>.
+    parsed = urlparse(playwright_endpoint)
+    port = parsed.port or 3000
+    host_header = f"localhost:{port}"
+
+    return MCPClient(lambda: sse_client(sse_url, headers={"Host": host_header}))
 
 
 class AgentRunner:
