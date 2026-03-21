@@ -14,7 +14,7 @@ import traceback
 import uuid
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -74,14 +74,12 @@ async def invocations(request: Request):
             plan = body.get("plan")
             if not plan:
                 return JSONResponse({"sessionId": session_id, "mode": mode, "error": "plan required"})
-            result = runner.automate(plan=plan, session_id=session_id, team_id=body.get("teamId", "default"))
-            return JSONResponse({
-                "sessionId": result["sessionId"],
-                "mode": "automate",
-                "result": result["result"],
-                "novnc_url": result.get("novnc_url"),
-                "novnc_expires_in": result.get("novnc_expires_in"),
-            })
+            # Stream newline-delimited JSON events so frontend gets noVNC URL
+            # immediately (before test starts) and result when test completes.
+            return StreamingResponse(
+                runner.automate_stream(plan=plan, session_id=session_id, team_id=body.get("teamId", "default")),
+                media_type="application/x-ndjson",
+            )
         else:
             return JSONResponse({"sessionId": session_id, "mode": mode, "error": f"Unknown mode: {mode}"})
 

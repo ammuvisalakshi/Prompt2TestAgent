@@ -204,13 +204,16 @@ class AgentRunner:
             "plan": plan,
         }
 
-    def automate(self, plan: dict, session_id: str, team_id: str) -> dict[str, Any]:
+    def automate_stream(self, plan: dict, session_id: str, team_id: str):
         """
-        Automate Mode — execute the plan using a dedicated per-session Playwright MCP task.
+        Automate Mode — streams two newline-delimited JSON events:
 
-        Spins up a fresh ECS Fargate task for this session, connects Playwright MCP to it,
-        runs the test, then stops the task. Returns novnc_url so the frontend can show
-        the live browser view in a pop-out window.
+          1. {"event":"session_ready","novnc_url":"..."}
+             Emitted as soon as the ECS task is running and MCP port is ready.
+             Frontend opens the noVNC pop-out immediately so user watches live.
+
+          2. {"event":"complete","sessionId":"...","result":{...},"novnc_url":"..."}
+             Emitted after the test finishes. Task stays alive for GRACE_PERIOD_SECONDS.
         """
         if not session_id:
             session_id = str(uuid.uuid4())
@@ -232,6 +235,14 @@ class AgentRunner:
             logger.info(f"[automate] MCP endpoint: {ecs_session.mcp_endpoint}")
             logger.info(f"[automate] noVNC URL: {ecs_session.novnc_url}")
 
+            # ── Event 1: session ready — emit NOW so frontend opens noVNC live ──
+            yield json.dumps({
+                "event": "session_ready",
+                "novnc_url": ecs_session.novnc_url,
+                "novnc_expires_in": ECSSession.GRACE_PERIOD_SECONDS,
+            }) + "\n"
+
+            # ── Execute the test plan ─────────────────────────────────────────
             with _build_mcp_client(ecs_session.mcp_endpoint) as mcp:
                 tools = mcp.list_tools_sync()
                 agent = Agent(
@@ -241,18 +252,17 @@ class AgentRunner:
                 )
                 response = agent(prompt)
 
-            novnc_url = ecs_session.novnc_url
-            grace_seconds = ECSSession.GRACE_PERIOD_SECONDS
+            result = self._parse_plan(str(response))
 
-        result = self._parse_plan(str(response))
-
-        return {
-            "sessionId": session_id,
-            "mode": "automate",
-            "result": result,
-            "novnc_url": novnc_url,
-            "novnc_expires_in": grace_seconds,  # seconds until task stops
-        }
+            # ── Event 2: test complete ────────────────────────────────────────
+            yield json.dumps({
+                "event": "complete",
+                "sessionId": session_id,
+                "mode": "automate",
+                "result": result,
+                "novnc_url": ecs_session.novnc_url,
+                "novnc_expires_in": ECSSession.GRACE_PERIOD_SECONDS,
+            }) + "\n"
 
     def _parse_plan(self, raw: str) -> dict:
         """Parse agent response — strip markdown fences, extract JSON if embedded in text."""
