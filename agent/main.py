@@ -70,14 +70,27 @@ async def invocations(request: Request):
                 conversation_history=body.get("conversationHistory", ""),
             )
             return JSONResponse({"sessionId": result["sessionId"], "mode": "plan", "plan": result["plan"]})
+        elif mode == "start_session":
+            # Spin up ECS browser task and return noVNC URL immediately.
+            # Frontend opens live browser popup, then calls automate to run the test.
+            result = runner.start_session(
+                session_id=session_id,
+                team_id=body.get("teamId", "default"),
+            )
+            return JSONResponse(result)
         elif mode == "automate":
             plan = body.get("plan")
             if not plan:
                 return JSONResponse({"sessionId": session_id, "mode": mode, "error": "plan required"})
-            # Stream newline-delimited JSON events so frontend gets noVNC URL
-            # immediately (before test starts) and result when test completes.
             return StreamingResponse(
-                runner.automate_stream(plan=plan, session_id=session_id, team_id=body.get("teamId", "default")),
+                runner.automate_stream(
+                    plan=plan,
+                    session_id=session_id,
+                    team_id=body.get("teamId", "default"),
+                    task_arn=body.get("task_arn"),
+                    cluster=body.get("cluster"),
+                    mcp_endpoint=body.get("mcp_endpoint"),
+                ),
                 media_type="application/x-ndjson",
             )
         else:

@@ -228,16 +228,41 @@ class AgentRunner:
             "plan": plan,
         }
 
-    def automate_stream(self, plan: dict, session_id: str, team_id: str):
+    def start_session(self, session_id: str, team_id: str) -> dict[str, Any]:
         """
-        Automate Mode — streams two newline-delimited JSON events:
+        Start Mode — spin up an ECS browser task and return the noVNC URL immediately.
+        The task stays running; automate_stream will stop it when the test finishes.
+        """
+        if not session_id:
+            session_id = str(uuid.uuid4())
 
-          1. {"event":"session_ready","novnc_url":"..."}
-             Emitted as soon as the ECS task is running and MCP port is ready.
-             Frontend opens the noVNC pop-out immediately so user watches live.
+        logger.info(f"[start_session] session={session_id} team={team_id}")
 
-          2. {"event":"complete","sessionId":"...","result":{...}}
-             Emitted after the test finishes. Task is stopped immediately.
+        from agent.ecs_session import ECSSession
+
+        ecs = ECSSession(region=self.region)
+        ecs._start()  # start but don't stop — caller owns lifecycle
+
+        logger.info(f"[start_session] task={ecs.task_arn} novnc={ecs.novnc_url}")
+
+        return {
+            "sessionId": session_id,
+            "mode": "start_session",
+            "novnc_url": ecs.novnc_url,
+            "mcp_endpoint": ecs.mcp_endpoint,
+            "task_arn": ecs.task_arn,
+            "cluster": ecs.cluster,
+        }
+
+    def automate_stream(self, plan: dict, session_id: str, team_id: str,
+                        task_arn: str | None = None, cluster: str | None = None,
+                        mcp_endpoint: str | None = None):
+        """
+        Automate Mode — executes the test plan against a browser session.
+
+        If task_arn + cluster + mcp_endpoint are provided, reuses an existing
+        pre-started ECS session (2-call flow). Otherwise spins up a new one.
+        Always stops the task when done.
         """
         if not session_id:
             session_id = str(uuid.uuid4())
@@ -255,6 +280,34 @@ class AgentRunner:
 
         from agent.ecs_session import ECSSession
 
+        if task_arn and cluster and mcp_endpoint:
+            # ── Reuse pre-started session (2-call flow) ───────────────────────
+            logger.info(f"[automate] Reusing existing task: {task_arn}")
+            try:
+                with _build_mcp_client(mcp_endpoint) as mcp:
+                    tools = mcp.list_tools_sync()
+                    agent = Agent(
+                        model=_build_model(),
+                        system_prompt=AUTOMATE_SYSTEM_PROMPT,
+                        tools=tools,
+                    )
+                    response = agent(prompt)
+                result = self._parse_plan(str(response))
+            finally:
+                ecs = ECSSession(region=self.region)
+                ecs.task_arn = task_arn
+                ecs.cluster = cluster
+                ecs._stop()
+
+            yield json.dumps({
+                "event": "complete",
+                "sessionId": session_id,
+                "mode": "automate",
+                "result": result,
+            }) + "\n"
+            return
+
+        # ── Spin up new session (legacy single-call flow) ─────────────────────
         with ECSSession(region=self.region) as ecs_session:
             logger.info(f"[automate] MCP endpoint: {ecs_session.mcp_endpoint}")
             logger.info(f"[automate] noVNC URL: {ecs_session.novnc_url}")
