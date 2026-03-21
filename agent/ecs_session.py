@@ -54,44 +54,72 @@ class ECSSession:
     # ── Startup ───────────────────────────────────────────────────────────────
 
     def _start(self):
-        """Launch a dedicated ECS task and wait until MCP is ready."""
+        """
+        Acquire a browser task — tries warm pool first (instant), falls back to RunTask (~60s).
+
+        Warm pool strategy:
+          1. List RUNNING tasks in the cluster
+          2. If one exists, claim it immediately (0 cold start)
+          3. Otherwise, call RunTask and wait for it to start (slow path)
+        """
         # Read infra config from SSM — no hardcoded values
         self.cluster = _get_ssm(self.ssm, "cluster-name")
         task_family = _get_ssm(self.ssm, "task-definition-family")
         subnet_ids = _get_ssm(self.ssm, "subnet-ids").split(",")
         sg_id = _get_ssm(self.ssm, "security-group-id")
 
-        logger.info(f"[ecs_session] Launching task family={task_family} cluster={self.cluster}")
+        # ── Try warm pool first ───────────────────────────────────────────────
+        warm_task_arn = self._claim_warm_task()
+        if warm_task_arn:
+            self.task_arn = warm_task_arn
+            logger.info(f"[ecs_session] Claimed warm task: {self.task_arn}")
+        else:
+            # ── Cold start fallback ───────────────────────────────────────────
+            logger.info(f"[ecs_session] No warm task available — launching cold task family={task_family}")
+            response = self.ecs.run_task(
+                cluster=self.cluster,
+                taskDefinition=task_family,
+                launchType="FARGATE",
+                networkConfiguration={
+                    "awsvpcConfiguration": {
+                        "subnets": subnet_ids,
+                        "securityGroups": [sg_id],
+                        "assignPublicIp": "ENABLED",
+                    }
+                },
+            )
+            if not response.get("tasks"):
+                failures = response.get("failures", [])
+                raise RuntimeError(f"ECS RunTask failed: {failures}")
+            self.task_arn = response["tasks"][0]["taskArn"]
+            logger.info(f"[ecs_session] Cold task launched: {self.task_arn}")
+            self._wait_for_running()
 
-        response = self.ecs.run_task(
-            cluster=self.cluster,
-            taskDefinition=task_family,   # resolves to latest active revision
-            launchType="FARGATE",
-            networkConfiguration={
-                "awsvpcConfiguration": {
-                    "subnets": subnet_ids,
-                    "securityGroups": [sg_id],
-                    "assignPublicIp": "ENABLED",
-                }
-            },
-        )
-
-        if not response.get("tasks"):
-            failures = response.get("failures", [])
-            raise RuntimeError(f"ECS RunTask failed: {failures}")
-
-        self.task_arn = response["tasks"][0]["taskArn"]
-        logger.info(f"[ecs_session] Task launched: {self.task_arn}")
-
-        self._wait_for_running()
         self.public_ip = self._get_public_ip()
-        logger.info(f"[ecs_session] Task running at public IP: {self.public_ip}")
+        logger.info(f"[ecs_session] Task IP: {self.public_ip}")
 
         self.mcp_endpoint = f"http://{self.public_ip}:3000"
         self.novnc_url = f"http://{self.public_ip}:6080/vnc.html"
 
-        # Wait until playwright-mcp is actually accepting connections on port 3000
+        # Wait until playwright-mcp is accepting connections on port 3000
         self._wait_for_mcp_port()
+
+    def _claim_warm_task(self) -> str | None:
+        """
+        Return the ARN of a RUNNING task in the cluster, or None if none available.
+        The warm pool ECS Service will automatically replace the claimed task.
+        """
+        try:
+            response = self.ecs.list_tasks(
+                cluster=self.cluster,
+                desiredStatus="RUNNING",
+            )
+            task_arns = response.get("taskArns", [])
+            if task_arns:
+                return task_arns[0]
+        except Exception as e:
+            logger.warning(f"[ecs_session] Failed to list warm tasks: {e}")
+        return None
 
     def _wait_for_running(self, timeout: int = 120):
         """Poll ECS until task reaches RUNNING state (Fargate cold start ~30-60s)."""
