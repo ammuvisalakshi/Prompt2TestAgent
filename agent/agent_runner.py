@@ -216,9 +216,11 @@ class AgentRunner:
 
         # Invoke the agent
         response = agent(full_prompt)
+        raw_text = str(response)
+        logger.info(f"[plan] raw response ({len(raw_text)} chars): {raw_text[:500]}")
 
         # Parse the JSON plan from the agent's response
-        plan = self._parse_plan(str(response))
+        plan = self._parse_plan(raw_text)
 
         return {
             "sessionId": session_id,
