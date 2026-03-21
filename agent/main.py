@@ -75,7 +75,12 @@ async def invocations(request: Request):
             if not plan:
                 return JSONResponse({"sessionId": session_id, "mode": mode, "error": "plan required"})
             result = runner.automate(plan=plan, session_id=session_id, team_id=body.get("teamId", "default"))
-            return JSONResponse({"sessionId": result["sessionId"], "mode": "automate", "result": result["result"]})
+            return JSONResponse({
+                "sessionId": result["sessionId"],
+                "mode": "automate",
+                "result": result["result"],
+                "novnc_url": result.get("novnc_url"),
+            })
         else:
             return JSONResponse({"sessionId": session_id, "mode": mode, "error": f"Unknown mode: {mode}"})
 

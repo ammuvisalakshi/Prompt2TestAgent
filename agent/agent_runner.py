@@ -130,25 +130,24 @@ def _build_tools_phase1() -> list:
     return [resolve_config, resolve_secret]
 
 
-def _build_mcp_client():
+def _build_mcp_client(endpoint: str):
     """
     Phase 2 — Return a connected MCPClient for the Playwright MCP server.
-    Must be used as a context manager: `with _build_mcp_client() as client:`
+    Must be used as a context manager: `with _build_mcp_client(endpoint) as client:`
+
+    Args:
+        endpoint: Full base URL of the Playwright MCP server, e.g. http://1.2.3.4:3000
     """
     from urllib.parse import urlparse
 
     from strands.tools.mcp import MCPClient  # lazy import — avoids startup crash if SDK mismatch
     from mcp.client.sse import sse_client
 
-    playwright_endpoint = os.environ.get(
-        "PLAYWRIGHT_MCP_ENDPOINT",
-        "http://localhost:3000"
-    )
-    sse_url = playwright_endpoint.rstrip("/") + "/sse"
+    sse_url = endpoint.rstrip("/") + "/sse"
 
-    # playwright-mcp validates the Host header is localhost for CSRF protection.
-    # The ALB sends its own hostname, so we override it to localhost:<port>.
-    parsed = urlparse(playwright_endpoint)
+    # playwright-mcp validates the Host header must be localhost for CSRF protection.
+    # Override it regardless of actual host so the server accepts the connection.
+    parsed = urlparse(endpoint)
     port = parsed.port or 3000
     host_header = f"localhost:{port}"
 
@@ -207,8 +206,11 @@ class AgentRunner:
 
     def automate(self, plan: dict, session_id: str, team_id: str) -> dict[str, Any]:
         """
-        Automate Mode — execute the plan using Playwright MCP.
-        Connects to the Playwright MCP server via PLAYWRIGHT_MCP_ENDPOINT env var.
+        Automate Mode — execute the plan using a dedicated per-session Playwright MCP task.
+
+        Spins up a fresh ECS Fargate task for this session, connects Playwright MCP to it,
+        runs the test, then stops the task. Returns novnc_url so the frontend can show
+        the live browser view in a pop-out window.
         """
         if not session_id:
             session_id = str(uuid.uuid4())
@@ -224,14 +226,22 @@ class AgentRunner:
             f"Steps:\n{steps_text}"
         )
 
-        with _build_mcp_client() as mcp:
-            tools = mcp.list_tools_sync()
-            agent = Agent(
-                model=_build_model(),
-                system_prompt=AUTOMATE_SYSTEM_PROMPT,
-                tools=tools,
-            )
-            response = agent(prompt)
+        from agent.ecs_session import ECSSession
+
+        with ECSSession(region=self.region) as ecs_session:
+            logger.info(f"[automate] MCP endpoint: {ecs_session.mcp_endpoint}")
+            logger.info(f"[automate] noVNC URL: {ecs_session.novnc_url}")
+
+            with _build_mcp_client(ecs_session.mcp_endpoint) as mcp:
+                tools = mcp.list_tools_sync()
+                agent = Agent(
+                    model=_build_model(),
+                    system_prompt=AUTOMATE_SYSTEM_PROMPT,
+                    tools=tools,
+                )
+                response = agent(prompt)
+
+            novnc_url = ecs_session.novnc_url
 
         result = self._parse_plan(str(response))
 
@@ -239,6 +249,7 @@ class AgentRunner:
             "sessionId": session_id,
             "mode": "automate",
             "result": result,
+            "novnc_url": novnc_url,
         }
 
     def _parse_plan(self, raw: str) -> dict:
