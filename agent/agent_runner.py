@@ -80,10 +80,13 @@ HOW TO BEHAVE:
 4. GENERATE THE PLAN when you have enough to write clear, unambiguous steps.
    For simple tasks (navigate → search → screenshot), 1-2 rounds of clarification is enough.
    For complex tasks (login → multi-step form → assertion), ask until each step is clear.
-   Always generate the plan as pure JSON with no markdown, no extra text.
+   Before returning the JSON, include a "confirmationMessage" field that summarises in plain English
+   exactly what was agreed — this is shown to the user as a chat message so they can confirm.
+   Always return pure JSON with no markdown, no extra text outside the JSON object.
 
 Return the execution plan as a JSON object with this exact shape:
 {
+  "confirmationMessage": "<friendly 1-2 sentence summary of exactly what test was agreed upon, e.g. 'Got it! We'll navigate to amazon.com, search for iPhone 17 Pro, and screenshot the search results page.'>",
   "summary": "<one-line summary of what is being tested>",
   "steps": [
     {
