@@ -212,8 +212,8 @@ class AgentRunner:
              Emitted as soon as the ECS task is running and MCP port is ready.
              Frontend opens the noVNC pop-out immediately so user watches live.
 
-          2. {"event":"complete","sessionId":"...","result":{...},"novnc_url":"..."}
-             Emitted after the test finishes. Task stays alive for GRACE_PERIOD_SECONDS.
+          2. {"event":"complete","sessionId":"...","result":{...}}
+             Emitted after the test finishes. Task is stopped immediately.
         """
         if not session_id:
             session_id = str(uuid.uuid4())
@@ -235,11 +235,10 @@ class AgentRunner:
             logger.info(f"[automate] MCP endpoint: {ecs_session.mcp_endpoint}")
             logger.info(f"[automate] noVNC URL: {ecs_session.novnc_url}")
 
-            # ── Event 1: session ready — emit NOW so frontend opens noVNC live ──
+            # ── Event 1: session ready ────────────────────────────────────────
             yield json.dumps({
                 "event": "session_ready",
                 "novnc_url": ecs_session.novnc_url,
-                "novnc_expires_in": ECSSession.GRACE_PERIOD_SECONDS,
             }) + "\n"
 
             # ── Execute the test plan ─────────────────────────────────────────
@@ -254,14 +253,12 @@ class AgentRunner:
 
             result = self._parse_plan(str(response))
 
-            # ── Event 2: test complete ────────────────────────────────────────
+            # ── Event 2: test complete — task stops immediately after this ─────
             yield json.dumps({
                 "event": "complete",
                 "sessionId": session_id,
                 "mode": "automate",
                 "result": result,
-                "novnc_url": ecs_session.novnc_url,
-                "novnc_expires_in": ECSSession.GRACE_PERIOD_SECONDS,
             }) + "\n"
 
     def _parse_plan(self, raw: str) -> dict:
