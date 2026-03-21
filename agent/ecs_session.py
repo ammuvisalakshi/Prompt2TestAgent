@@ -149,16 +149,35 @@ class ECSSession:
 
     # ── Teardown ──────────────────────────────────────────────────────────────
 
+    GRACE_PERIOD_SECONDS = 300  # 5 minutes — user can inspect browser state after test
+
     def _stop(self):
-        """Stop the ECS task — called automatically on context manager exit."""
+        """
+        Schedule the ECS task to stop after a grace period.
+
+        The task stays alive for GRACE_PERIOD_SECONDS after the test finishes so the
+        user can pop out the noVNC window and inspect the final browser state.
+        Uses a daemon thread so the agent response is returned immediately.
+        """
         if not self.task_arn:
             return
-        try:
-            self.ecs.stop_task(
-                cluster=self.cluster,
-                task=self.task_arn,
-                reason="Prompt2Test session ended",
-            )
-            logger.info(f"[ecs_session] Task stopped: {self.task_arn}")
-        except Exception as e:
-            logger.warning(f"[ecs_session] Failed to stop task {self.task_arn}: {e}")
+
+        task_arn = self.task_arn
+        cluster = self.cluster
+
+        def stop_after_grace():
+            time.sleep(self.GRACE_PERIOD_SECONDS)
+            try:
+                self.ecs.stop_task(
+                    cluster=cluster,
+                    task=task_arn,
+                    reason="Prompt2Test session ended — grace period elapsed",
+                )
+                logger.info(f"[ecs_session] Task stopped after grace period: {task_arn}")
+            except Exception as e:
+                logger.warning(f"[ecs_session] Failed to stop task {task_arn}: {e}")
+
+        import threading
+        thread = threading.Thread(target=stop_after_grace, daemon=True)
+        thread.start()
+        logger.info(f"[ecs_session] Task {task_arn} will stop in {self.GRACE_PERIOD_SECONDS}s")

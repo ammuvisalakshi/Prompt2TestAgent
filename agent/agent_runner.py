@@ -242,6 +242,7 @@ class AgentRunner:
                 response = agent(prompt)
 
             novnc_url = ecs_session.novnc_url
+            grace_seconds = ECSSession.GRACE_PERIOD_SECONDS
 
         result = self._parse_plan(str(response))
 
@@ -250,6 +251,7 @@ class AgentRunner:
             "mode": "automate",
             "result": result,
             "novnc_url": novnc_url,
+            "novnc_expires_in": grace_seconds,  # seconds until task stops
         }
 
     def _parse_plan(self, raw: str) -> dict:

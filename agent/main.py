@@ -80,6 +80,7 @@ async def invocations(request: Request):
                 "mode": "automate",
                 "result": result["result"],
                 "novnc_url": result.get("novnc_url"),
+                "novnc_expires_in": result.get("novnc_expires_in"),
             })
         else:
             return JSONResponse({"sessionId": session_id, "mode": mode, "error": f"Unknown mode: {mode}"})
