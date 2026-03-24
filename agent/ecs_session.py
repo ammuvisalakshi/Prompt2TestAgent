@@ -1,15 +1,17 @@
 """
-ECS Session Manager — NLB fixed-endpoint approach.
+ECS Session Manager — direct task IP from NLB target group.
 
-MCP    → NLB DNS on port 3000 (TCP passthrough, Host header unchanged,
-          playwright-mcp SSE CSRF check passes, load-balanced across tasks)
-noVNC  → NLB DNS on port 6080 (TCP passthrough, WebSocket friendly)
+Problem: NLB routes MCP (agent) and noVNC (browser) by separate 5-tuple hashes,
+so they can land on different tasks → blank noVNC screen.
 
-Both endpoints resolved from a single SSM param: nlb-dns (set at CDK deploy time,
-never changes at runtime). Cached after first call — ~0ms on repeat.
+Fix: agent calls DescribeTargetHealth → picks one healthy task IP → uses that
+IP directly for BOTH MCP (:3000) and noVNC (:6080). Guarantees same task.
+
+start_session reads mcp-tg-arn from SSM (cached), then picks a healthy task.
 """
 
 import logging
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
@@ -40,17 +42,32 @@ def _load_ssm_params(ssm_client, keys: list[str]) -> dict[str, str]:
     return {k: _SSM_CACHE[k] for k in keys}
 
 
+def _pick_healthy_task_ip(elbv2_client, tg_arn: str) -> str:
+    """Return a random healthy task IP from the NLB MCP target group."""
+    resp = elbv2_client.describe_target_health(TargetGroupArn=tg_arn)
+    healthy = [
+        t["Target"]["Id"]
+        for t in resp["TargetHealthDescriptions"]
+        if t["TargetHealth"]["State"] == "healthy"
+    ]
+    if not healthy:
+        raise RuntimeError("No healthy playwright-mcp tasks in NLB target group")
+    return random.choice(healthy)
+
+
 class ECSSession:
     """
     Resolves endpoints for the always-on playwright-mcp ECS Service.
 
-    Both MCP (:3000) and noVNC (:6080) connect through the NLB DNS.
-    NLB is TCP passthrough — no Host-header rewrite, no CSRF issues.
+    Picks one healthy task IP from the NLB MCP target group, then connects
+    both MCP (:3000) and noVNC (:6080) directly to that task IP.
+    This guarantees MCP and noVNC land on the same task (same browser screen).
     """
 
     def __init__(self, region: str = "us-east-1"):
         self.region = region
-        self.ssm = boto3.client("ssm", region_name=region)
+        self.ssm   = boto3.client("ssm",   region_name=region)
+        self.elbv2 = boto3.client("elbv2", region_name=region)
         self.task_arn: str | None = None    # kept for API compatibility
         self.cluster: str | None = None     # kept for API compatibility
         self.mcp_endpoint: str | None = None
@@ -67,16 +84,17 @@ class ECSSession:
 
     def _start(self):
         """
-        Fetch NLB DNS from SSM (cached after first call — ~0ms on repeat).
-        nlb-dns → NLB DNS name, used for both MCP (:3000) and noVNC (:6080).
+        1. Read mcp-tg-arn from SSM (cached after first call).
+        2. DescribeTargetHealth → pick one healthy task IP.
+        3. Set both MCP and noVNC endpoints to that task's direct IP.
         """
-        params = _load_ssm_params(self.ssm, ["nlb-dns"])
+        params  = _load_ssm_params(self.ssm, ["mcp-tg-arn"])
+        tg_arn  = params["mcp-tg-arn"]
+        task_ip = _pick_healthy_task_ip(self.elbv2, tg_arn)
 
-        nlb_dns = params["nlb-dns"]
-
-        self.mcp_endpoint = f"http://{nlb_dns}:3000"
-        self.novnc_url    = f"http://{nlb_dns}:6080/vnc.html"
-        logger.info(f"[ecs_session] MCP -> {nlb_dns}:3000  noVNC -> {nlb_dns}:6080")
+        self.mcp_endpoint = f"http://{task_ip}:3000"
+        self.novnc_url    = f"http://{task_ip}:6080/vnc.html"
+        logger.info(f"[ecs_session] task_ip={task_ip}  MCP -> :3000  noVNC -> :6080")
 
     # ── Teardown ──────────────────────────────────────────────────────────────
 
