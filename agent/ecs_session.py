@@ -1,16 +1,18 @@
 """
-ECS Session Manager — returns fixed ALB endpoints for the always-on Playwright MCP service.
+ECS Session Manager — hybrid fixed-endpoint approach.
 
-The ALB provides a stable DNS name that never changes, so start_session is instant:
-  1. Read alb-dns from SSM (cached after first call — ~0ms on repeat)
-  2. Return mcp_endpoint + novnc_url immediately
+noVNC  → ALB DNS (fixed, instant lookup, no Host-header issues on port 6080)
+MCP    → task's own public IP registered in SSM at startup (direct connection,
+          bypasses ALB which rewrites Host header and breaks playwright-mcp SSE)
 
-No IP discovery, no ListTasks, no DescribeNetworkInterfaces.
-The ECS Service (desiredCount=1) keeps one warm task behind the ALB at all times.
-playwright-mcp --isolated gives each test session its own browser context.
+On task startup, entrypoint.sh calls:
+    curl checkip.amazonaws.com → gets public IP → aws ssm put-parameter current-mcp-host
+
+start_session reads both SSM params (cached after first call — ~0ms on repeat).
 """
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
 
@@ -29,16 +31,24 @@ def _get_ssm(ssm_client, name: str) -> str:
     return _SSM_CACHE[name]
 
 
+def _load_ssm_params(ssm_client, keys: list[str]) -> dict[str, str]:
+    """Fetch multiple SSM params in parallel — eliminates sequential API latency."""
+    missing = [k for k in keys if k not in _SSM_CACHE]
+    if missing:
+        with ThreadPoolExecutor(max_workers=len(missing)) as ex:
+            futures = {ex.submit(_get_ssm, ssm_client, k): k for k in missing}
+            for f in as_completed(futures):
+                f.result()  # raises on error
+    return {k: _SSM_CACHE[k] for k in keys}
+
+
 class ECSSession:
     """
-    Thin wrapper that resolves the ALB DNS name and constructs the MCP + noVNC URLs.
+    Resolves endpoints for the always-on playwright-mcp ECS Service.
 
-    Usage (unchanged from caller's perspective):
-        session = ECSSession(region="us-east-1")
-        session._start()
-        # session.mcp_endpoint  → "http://<alb-dns>:3000"
-        # session.novnc_url     → "http://<alb-dns>:6080/vnc.html"
-        session._stop()   # no-op — task is a shared resource managed by ECS Service
+    noVNC  → ALB DNS (fixed URL, instant, no CSRF issues on port 6080)
+    MCP    → task's direct public IP from SSM (avoids ALB Host-header rewrite
+             that breaks playwright-mcp SSE CSRF on port 3000)
     """
 
     def __init__(self, region: str = "us-east-1"):
@@ -46,7 +56,7 @@ class ECSSession:
         self.ssm = boto3.client("ssm", region_name=region)
         self.task_arn: str | None = None    # kept for API compatibility
         self.cluster: str | None = None     # kept for API compatibility
-        self.public_ip: str | None = None   # kept for API compatibility
+        self.public_ip: str | None = None
         self.mcp_endpoint: str | None = None
         self.novnc_url: str | None = None
 
@@ -61,19 +71,25 @@ class ECSSession:
 
     def _start(self):
         """
-        Resolve the ALB DNS name from SSM and build the endpoint URLs.
-        Cached after the first call — effectively free on subsequent calls.
+        Fetch both SSM params in parallel (cached after first call).
+        alb-dns         → fixed ALB DNS for noVNC (port 6080)
+        current-mcp-host → task's own public IP for direct MCP (port 3000)
         """
-        alb_dns = _get_ssm(self.ssm, "alb-dns")
-        self.mcp_endpoint = f"http://{alb_dns}:3000"
-        self.novnc_url    = f"http://{alb_dns}:6080/vnc.html"
-        logger.info(f"[ecs_session] ALB endpoint ready: {alb_dns}")
+        params = _load_ssm_params(self.ssm, ["alb-dns", "current-mcp-host"])
+
+        alb_dns  = params["alb-dns"]
+        mcp_host = params["current-mcp-host"]
+
+        self.public_ip    = mcp_host
+        self.mcp_endpoint = f"http://{mcp_host}:3000"        # direct IP — no ALB
+        self.novnc_url    = f"http://{alb_dns}:6080/vnc.html"  # ALB — fixed URL
+        logger.info(f"[ecs_session] MCP → {mcp_host}:3000  noVNC → {alb_dns}:6080")
 
     # ── Teardown ──────────────────────────────────────────────────────────────
 
     def _stop(self):
         """
-        No-op. The ECS task is a shared resource managed by the ECS Service.
-        playwright-mcp --isolated ensures each test session gets a fresh browser context.
+        No-op. Task is a shared warm resource; playwright-mcp --isolated
+        gives each test its own browser context without restarting the task.
         """
-        logger.info("[ecs_session] ALB mode — task is shared, not stopped after session")
+        logger.info("[ecs_session] Shared task — not stopped after session")
