@@ -1,14 +1,12 @@
 """
-ECS Session Manager — hybrid fixed-endpoint approach.
+ECS Session Manager — NLB fixed-endpoint approach.
 
-noVNC  → ALB DNS (fixed, instant lookup, no Host-header issues on port 6080)
-MCP    → task's own public IP registered in SSM at startup (direct connection,
-          bypasses ALB which rewrites Host header and breaks playwright-mcp SSE)
+MCP    → NLB DNS on port 3000 (TCP passthrough, Host header unchanged,
+          playwright-mcp SSE CSRF check passes, load-balanced across tasks)
+noVNC  → NLB DNS on port 6080 (TCP passthrough, WebSocket friendly)
 
-On task startup, entrypoint.sh calls:
-    curl checkip.amazonaws.com → gets public IP → aws ssm put-parameter current-mcp-host
-
-start_session reads both SSM params (cached after first call — ~0ms on repeat).
+Both endpoints resolved from a single SSM param: nlb-dns (set at CDK deploy time,
+never changes at runtime). Cached after first call — ~0ms on repeat.
 """
 
 import logging
@@ -46,9 +44,8 @@ class ECSSession:
     """
     Resolves endpoints for the always-on playwright-mcp ECS Service.
 
-    noVNC  → ALB DNS (fixed URL, instant, no CSRF issues on port 6080)
-    MCP    → task's direct public IP from SSM (avoids ALB Host-header rewrite
-             that breaks playwright-mcp SSE CSRF on port 3000)
+    Both MCP (:3000) and noVNC (:6080) connect through the NLB DNS.
+    NLB is TCP passthrough — no Host-header rewrite, no CSRF issues.
     """
 
     def __init__(self, region: str = "us-east-1"):
@@ -56,7 +53,6 @@ class ECSSession:
         self.ssm = boto3.client("ssm", region_name=region)
         self.task_arn: str | None = None    # kept for API compatibility
         self.cluster: str | None = None     # kept for API compatibility
-        self.public_ip: str | None = None
         self.mcp_endpoint: str | None = None
         self.novnc_url: str | None = None
 
@@ -71,19 +67,16 @@ class ECSSession:
 
     def _start(self):
         """
-        Fetch both SSM params in parallel (cached after first call).
-        alb-dns         → fixed ALB DNS for noVNC (port 6080)
-        current-mcp-host → task's own public IP for direct MCP (port 3000)
+        Fetch NLB DNS from SSM (cached after first call — ~0ms on repeat).
+        nlb-dns → NLB DNS name, used for both MCP (:3000) and noVNC (:6080).
         """
-        params = _load_ssm_params(self.ssm, ["alb-dns", "current-mcp-host"])
+        params = _load_ssm_params(self.ssm, ["nlb-dns"])
 
-        alb_dns  = params["alb-dns"]
-        mcp_host = params["current-mcp-host"]
+        nlb_dns = params["nlb-dns"]
 
-        self.public_ip    = mcp_host
-        self.mcp_endpoint = f"http://{mcp_host}:3000"        # direct IP — no ALB
-        self.novnc_url    = f"http://{alb_dns}:6080/vnc.html"  # ALB — fixed URL
-        logger.info(f"[ecs_session] MCP → {mcp_host}:3000  noVNC → {alb_dns}:6080")
+        self.mcp_endpoint = f"http://{nlb_dns}:3000"
+        self.novnc_url    = f"http://{nlb_dns}:6080/vnc.html"
+        logger.info(f"[ecs_session] MCP -> {nlb_dns}:3000  noVNC -> {nlb_dns}:6080")
 
     # ── Teardown ──────────────────────────────────────────────────────────────
 
