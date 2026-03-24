@@ -8,6 +8,7 @@ Each session gets its own isolated browser container; task is stopped when done.
 import logging
 import socket
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
 
@@ -15,10 +16,28 @@ logger = logging.getLogger(__name__)
 
 SSM_PREFIX = "/prompt2test/playwright"
 
+# Cache SSM params for the lifetime of the container — they never change at runtime.
+# Eliminates 4 sequential API calls on every start_session after the first.
+_SSM_CACHE: dict[str, str] = {}
+
 
 def _get_ssm(ssm_client, name: str) -> str:
-    response = ssm_client.get_parameter(Name=f"{SSM_PREFIX}/{name}")
-    return response["Parameter"]["Value"]
+    if name not in _SSM_CACHE:
+        response = ssm_client.get_parameter(Name=f"{SSM_PREFIX}/{name}")
+        _SSM_CACHE[name] = response["Parameter"]["Value"]
+    return _SSM_CACHE[name]
+
+
+def _load_ssm_params(ssm_client) -> dict[str, str]:
+    """Fetch all required SSM params in parallel — ~4x faster than sequential."""
+    keys = ["cluster-name", "task-definition-family", "subnet-ids", "security-group-id"]
+    missing = [k for k in keys if k not in _SSM_CACHE]
+    if missing:
+        with ThreadPoolExecutor(max_workers=len(missing)) as ex:
+            futures = {ex.submit(_get_ssm, ssm_client, k): k for k in missing}
+            for f in as_completed(futures):
+                f.result()  # raises on error
+    return {k: _SSM_CACHE[k] for k in keys}
 
 
 class ECSSession:
@@ -62,17 +81,24 @@ class ECSSession:
           2. If one exists, claim it immediately (0 cold start)
           3. Otherwise, call RunTask and wait for it to start (slow path)
         """
-        # Read infra config from SSM — no hardcoded values
-        self.cluster = _get_ssm(self.ssm, "cluster-name")
-        task_family = _get_ssm(self.ssm, "task-definition-family")
-        subnet_ids = _get_ssm(self.ssm, "subnet-ids").split(",")
-        sg_id = _get_ssm(self.ssm, "security-group-id")
+        # Read all SSM params in parallel — cached after first call
+        params = _load_ssm_params(self.ssm)
+        self.cluster   = params["cluster-name"]
+        task_family    = params["task-definition-family"]
+        subnet_ids     = params["subnet-ids"].split(",")
+        sg_id          = params["security-group-id"]
 
         # ── Try warm pool first ───────────────────────────────────────────────
         warm_task_arn = self._claim_warm_task()
         if warm_task_arn:
             self.task_arn = warm_task_arn
             logger.info(f"[ecs_session] Claimed warm task: {self.task_arn}")
+            self.public_ip = self._get_public_ip()
+            logger.info(f"[ecs_session] Task IP: {self.public_ip}")
+            self.mcp_endpoint = f"http://{self.public_ip}:3000"
+            self.novnc_url    = f"http://{self.public_ip}:6080/vnc.html"
+            # Warm task already has playwright-mcp running — skip port poll
+            logger.info("[ecs_session] Warm task claimed — skipping port wait")
         else:
             # ── Cold start fallback ───────────────────────────────────────────
             logger.info(f"[ecs_session] No warm task available — launching cold task family={task_family}")
@@ -94,15 +120,12 @@ class ECSSession:
             self.task_arn = response["tasks"][0]["taskArn"]
             logger.info(f"[ecs_session] Cold task launched: {self.task_arn}")
             self._wait_for_running()
-
-        self.public_ip = self._get_public_ip()
-        logger.info(f"[ecs_session] Task IP: {self.public_ip}")
-
-        self.mcp_endpoint = f"http://{self.public_ip}:3000"
-        self.novnc_url = f"http://{self.public_ip}:6080/vnc.html"
-
-        # Wait until playwright-mcp is accepting connections on port 3000
-        self._wait_for_mcp_port()
+            self.public_ip = self._get_public_ip()
+            logger.info(f"[ecs_session] Task IP: {self.public_ip}")
+            self.mcp_endpoint = f"http://{self.public_ip}:3000"
+            self.novnc_url    = f"http://{self.public_ip}:6080/vnc.html"
+            # Cold start — wait for playwright-mcp to be ready
+            self._wait_for_mcp_port()
 
     def _claim_warm_task(self) -> str | None:
         """
