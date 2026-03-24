@@ -282,22 +282,16 @@ class AgentRunner:
 
         if task_arn and cluster and mcp_endpoint:
             # ── Reuse pre-started session (2-call flow) ───────────────────────
-            logger.info(f"[automate] Reusing existing task: {task_arn}")
-            try:
-                with _build_mcp_client(mcp_endpoint) as mcp:
-                    tools = mcp.list_tools_sync()
-                    agent = Agent(
-                        model=_build_model(),
-                        system_prompt=AUTOMATE_SYSTEM_PROMPT,
-                        tools=tools,
-                    )
-                    response = agent(prompt)
-                result = self._parse_plan(str(response))
-            finally:
-                ecs = ECSSession(region=self.region)
-                ecs.task_arn = task_arn
-                ecs.cluster = cluster
-                ecs._stop()
+            logger.info(f"[automate] Using ALB endpoint: {mcp_endpoint}")
+            with _build_mcp_client(mcp_endpoint) as mcp:
+                tools = mcp.list_tools_sync()
+                agent = Agent(
+                    model=_build_model(),
+                    system_prompt=AUTOMATE_SYSTEM_PROMPT,
+                    tools=tools,
+                )
+                response = agent(prompt)
+            result = self._parse_plan(str(response))
 
             yield json.dumps({
                 "event": "complete",
