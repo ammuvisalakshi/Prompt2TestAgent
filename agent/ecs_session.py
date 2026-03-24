@@ -46,6 +46,39 @@ def _load_ssm_params(ssm_client, keys: list[str]) -> dict[str, str]:
     return {k: _SSM_CACHE[k] for k in keys}
 
 
+async def _prewarm_browser_async(mcp_endpoint: str) -> None:
+    """Open Chromium to about:blank so it's visible in noVNC before automate starts."""
+    from mcp.client.sse import sse_client
+    from mcp import ClientSession
+
+    sse_url = mcp_endpoint.rstrip("/") + "/sse"
+    async with sse_client(sse_url, headers={"Host": "localhost:3000"}) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            await session.call_tool("browser_navigate", {"url": "about:blank"})
+    logger.info("[ecs_session] Browser pre-warmed — Chromium visible in noVNC")
+
+
+def _prewarm_browser(mcp_endpoint: str) -> None:
+    """Sync wrapper — runs pre-warm in a fresh thread to avoid event loop conflicts."""
+    import asyncio
+    import threading
+
+    errors: list = []
+
+    def _run():
+        try:
+            asyncio.run(_prewarm_browser_async(mcp_endpoint))
+        except Exception as exc:
+            errors.append(exc)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=10)
+    if errors:
+        logger.warning(f"[ecs_session] Browser pre-warm failed (non-fatal): {errors[0]}")
+
+
 def _wait_for_port(ip: str, port: int = 3000, timeout: int = MCP_PORT_READY_TIMEOUT) -> None:
     """Poll via TCP until playwright-mcp binds port 3000, then wait 1s for SSE handler."""
     deadline = time.time() + timeout
@@ -162,7 +195,8 @@ class ECSSession:
             if status == "RUNNING":
                 ip = _get_task_public_ip(self.ec2, task)
                 if ip:
-                    _wait_for_port(ip, 3000)  # poll until playwright-mcp actually binds port 3000
+                    _wait_for_port(ip, 3000)        # poll until playwright-mcp binds port 3000
+                    _prewarm_browser(f"http://{ip}:3000")  # open Chromium now so noVNC shows it immediately
                     return ip
 
             time.sleep(POLL_INTERVAL)
