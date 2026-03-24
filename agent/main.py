@@ -59,7 +59,7 @@ async def invocations(request: Request):
     try:
         from agent.agent_runner import AgentRunner
         runner = AgentRunner(
-            model_id=os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5"),
+            model_id=os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0"),
             region=os.environ.get("AWS_REGION", "us-east-1"),
         )
         if mode == "plan":

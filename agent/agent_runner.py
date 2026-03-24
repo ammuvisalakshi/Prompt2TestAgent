@@ -117,7 +117,7 @@ Additional rules:
 
 def _build_model() -> str:
     """Return the Bedrock model ID string for the Strands agent."""
-    return os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-3-5-sonnet-20241022-v2:0")
+    return os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
 
 
 def _build_tools_phase1() -> list:
