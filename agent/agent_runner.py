@@ -282,16 +282,26 @@ class AgentRunner:
 
         if task_arn and cluster and mcp_endpoint:
             # ── Reuse pre-started session (2-call flow) ───────────────────────
-            logger.info(f"[automate] Using ALB endpoint: {mcp_endpoint}")
-            with _build_mcp_client(mcp_endpoint) as mcp:
-                tools = mcp.list_tools_sync()
-                agent = Agent(
-                    model=_build_model(),
-                    system_prompt=AUTOMATE_SYSTEM_PROMPT,
-                    tools=tools,
-                )
-                response = agent(prompt)
-            result = self._parse_plan(str(response))
+            logger.info(f"[automate] MCP endpoint: {mcp_endpoint}")
+            try:
+                with _build_mcp_client(mcp_endpoint) as mcp:
+                    tools = mcp.list_tools_sync()
+                    agent = Agent(
+                        model=_build_model(),
+                        system_prompt=AUTOMATE_SYSTEM_PROMPT,
+                        tools=tools,
+                    )
+                    response = agent(prompt)
+                result = self._parse_plan(str(response))
+            finally:
+                # Always stop the task when test finishes (success or error)
+                try:
+                    import boto3
+                    ecs = boto3.client("ecs", region_name=self.region)
+                    ecs.stop_task(cluster=cluster, task=task_arn, reason="Test session completed")
+                    logger.info(f"[automate] Stopped task: {task_arn}")
+                except Exception as exc:
+                    logger.warning(f"[automate] Could not stop task: {exc}")
 
             yield json.dumps({
                 "event": "complete",

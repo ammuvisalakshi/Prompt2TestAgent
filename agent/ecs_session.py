@@ -12,6 +12,7 @@ Typical startup time: ~50-60 seconds (ECS scheduling + image + Chromium).
 """
 
 import logging
+import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -22,7 +23,7 @@ logger = logging.getLogger(__name__)
 SSM_PREFIX     = "/prompt2test/playwright"
 POLL_INTERVAL  = 3    # seconds between DescribeTasks polls
 TASK_TIMEOUT   = 120  # max seconds to wait for RUNNING + public IP
-READY_BUFFER   = 5    # extra seconds after RUNNING before connecting
+MCP_PORT_READY_TIMEOUT = 30  # max extra seconds to wait for port 3000 to accept connections
 
 _SSM_CACHE: dict[str, str] = {}
 
@@ -43,6 +44,20 @@ def _load_ssm_params(ssm_client, keys: list[str]) -> dict[str, str]:
             for f in as_completed(futures):
                 f.result()  # raises on error
     return {k: _SSM_CACHE[k] for k in keys}
+
+
+def _wait_for_port(ip: str, port: int = 3000, timeout: int = MCP_PORT_READY_TIMEOUT) -> None:
+    """Poll via TCP until playwright-mcp binds port 3000, then wait 1s for SSE handler."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((ip, port), timeout=2):
+                time.sleep(1)  # brief pause for SSE route registration
+                logger.info(f"[ecs_session] Port {port} ready on {ip}")
+                return
+        except OSError:
+            time.sleep(1)
+    raise RuntimeError(f"playwright-mcp not ready on {ip}:{port} after {timeout}s")
 
 
 def _get_task_public_ip(ec2_client, task: dict) -> str | None:
@@ -147,7 +162,7 @@ class ECSSession:
             if status == "RUNNING":
                 ip = _get_task_public_ip(self.ec2, task)
                 if ip:
-                    time.sleep(READY_BUFFER)  # let playwright-mcp finish binding port 3000
+                    _wait_for_port(ip, 3000)  # poll until playwright-mcp actually binds port 3000
                     return ip
 
             time.sleep(POLL_INTERVAL)
