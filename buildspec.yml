@@ -43,6 +43,13 @@ phases:
       - echo "=== Writing image URI for CDK deploy ==="
       - printf '{"imageUri":"%s"}' $IMAGE_URI > imageDetail.json
       - cat imageDetail.json
+      - echo "=== Updating AgentCore runtime to use new image ==="
+      - AGENT_RUNTIME_ID=Prompt2TestAgent-YTVbD4GrTi
+      - AGENT_ROLE_ARN=arn:aws:iam::${AWS_ACCOUNT_ID}:role/prompt2test-agentcore-role
+      - ARTIFACT=$(printf '{"containerConfiguration":{"containerUri":"%s"}}' "$ECR_REGISTRY/$IMAGE_REPO_NAME:latest")
+      - NETWORK='{"networkMode":"PUBLIC"}'
+      - aws bedrock-agentcore-control update-agent-runtime --agent-runtime-id $AGENT_RUNTIME_ID --agent-runtime-artifact "$ARTIFACT" --role-arn $AGENT_ROLE_ARN --network-configuration "$NETWORK" --region $AWS_DEFAULT_REGION
+      - echo "AgentCore runtime update triggered"
 
 artifacts:
   files:

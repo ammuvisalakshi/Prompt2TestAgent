@@ -110,6 +110,11 @@ export class Prompt2TestAgentStack extends cdk.Stack {
               actions: ["sts:GetCallerIdentity"],
               resources: ["*"],
             }),
+            // Update AgentCore runtime after image push
+            new iam.PolicyStatement({
+              actions: ["bedrock-agentcore:UpdateAgentRuntime", "iam:PassRole"],
+              resources: ["*"],
+            }),
           ],
         }),
       },
