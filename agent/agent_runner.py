@@ -156,6 +156,31 @@ Additional rules:
 """
 
 
+def _extract_replay_script(messages: list) -> list:
+    """
+    Extract all Playwright MCP tool calls from Strands agent message history.
+    Strands uses Bedrock Converse API format: toolUse blocks inside assistant messages.
+    Returns list of {tool, params} dicts for direct replay without LLM.
+    """
+    script = []
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        for block in msg.get("content", []):
+            if not isinstance(block, dict):
+                continue
+            tool_use = block.get("toolUse")
+            if tool_use and isinstance(tool_use, dict):
+                tool_name = tool_use.get("name", "")
+                # Only capture playwright_* tools (skip resolve_config etc)
+                if tool_name.startswith("playwright_"):
+                    script.append({
+                        "tool": tool_name,
+                        "params": tool_use.get("input", {}),
+                    })
+    return script
+
+
 def _build_model() -> str:
     """Return the Bedrock model ID string for the Strands agent."""
     return os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
@@ -417,6 +442,8 @@ class AgentRunner:
                     )
                     response = agent(prompt)
                 result = self._parse_plan(str(response))
+                result["replay_script"] = _extract_replay_script(agent.messages)
+                logger.info(f"[automate] captured {len(result['replay_script'])} replay commands")
             finally:
                 # Always stop the task when test finishes (success or error)
                 try:
@@ -457,6 +484,8 @@ class AgentRunner:
                 response = agent(prompt)
 
             result = self._parse_plan(str(response))
+            result["replay_script"] = _extract_replay_script(agent.messages)
+            logger.info(f"[automate] captured {len(result['replay_script'])} replay commands")
 
             # ── Event 2: test complete — task stops immediately after this ─────
             yield json.dumps({
@@ -465,6 +494,94 @@ class AgentRunner:
                 "mode": "automate",
                 "result": result,
             }) + "\n"
+
+    def replay_stream(self, replay_script: list, session_id: str,
+                      task_arn: str | None = None, cluster: str | None = None,
+                      mcp_endpoint: str | None = None):
+        """
+        Replay Mode — execute a saved replay script directly via Playwright MCP.
+        No LLM involved. Calls each recorded tool with its exact parameters.
+        Passes if all commands succeed without error, fails if any throws.
+        """
+        if not session_id:
+            session_id = str(uuid.uuid4())
+
+        logger.info(f"[replay] session={session_id} commands={len(replay_script)}")
+
+        if not replay_script:
+            yield json.dumps({
+                "event": "complete",
+                "sessionId": session_id,
+                "mode": "replay",
+                "result": {"passed": False, "summary": "No replay script found", "steps": [], "error": "Empty replay script"},
+            }) + "\n"
+            return
+
+        from agent.ecs_session import ECSSession
+
+        def _run_replay(mcp):
+            tools = mcp.list_tools_sync()
+            tools_by_name = {t.tool_name: t for t in tools}
+            steps = []
+            failed = False
+            for i, cmd in enumerate(replay_script):
+                tool_fn = tools_by_name.get(cmd["tool"])
+                if not tool_fn:
+                    logger.warning(f"[replay] unknown tool: {cmd['tool']}, skipping")
+                    continue
+                try:
+                    logger.info(f"[replay] step {i+1}: {cmd['tool']} params={str(cmd['params'])[:120]}")
+                    tool_fn(**cmd["params"])
+                    steps.append({"stepNumber": i + 1, "tool": cmd["tool"], "status": "passed"})
+                except Exception as exc:
+                    logger.error(f"[replay] step {i+1} FAILED: {exc}")
+                    steps.append({"stepNumber": i + 1, "tool": cmd["tool"], "status": "failed", "error": str(exc)})
+                    failed = True
+                    break
+            return steps, not failed
+
+        if mcp_endpoint:
+            try:
+                with _build_mcp_client(mcp_endpoint) as mcp:
+                    steps, passed = _run_replay(mcp)
+            finally:
+                if task_arn and cluster:
+                    try:
+                        import boto3
+                        ecs = boto3.client("ecs", region_name=self.region)
+                        ecs.stop_task(cluster=cluster, task=task_arn, reason="Replay session completed")
+                        logger.info(f"[replay] Stopped task: {task_arn}")
+                    except Exception as exc:
+                        logger.warning(f"[replay] Could not stop task: {exc}")
+
+            yield json.dumps({
+                "event": "complete",
+                "sessionId": session_id,
+                "mode": "replay",
+                "result": {
+                    "passed": passed,
+                    "summary": f"Replay {'passed' if passed else 'failed'} — {len(steps)} steps executed",
+                    "steps": steps,
+                },
+            }) + "\n"
+            return
+
+        # Spin up new ECS session if no existing session provided
+        with ECSSession(region=self.region) as ecs_session:
+            yield json.dumps({"event": "session_ready", "novnc_url": ecs_session.novnc_url}) + "\n"
+            with _build_mcp_client(ecs_session.mcp_endpoint) as mcp:
+                steps, passed = _run_replay(mcp)
+
+        yield json.dumps({
+            "event": "complete",
+            "sessionId": session_id,
+            "mode": "replay",
+            "result": {
+                "passed": passed,
+                "summary": f"Replay {'passed' if passed else 'failed'} — {len(steps)} steps executed",
+                "steps": steps,
+            },
+        }) + "\n"
 
     def _parse_plan(self, raw: str) -> dict:
         """Parse agent response — strip markdown fences, extract JSON if embedded in text."""

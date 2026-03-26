@@ -53,7 +53,7 @@ async def invocations(request: Request):
     mode = body.get("mode", "plan")
     prompt = body.get("inputText", "").strip()
 
-    if not prompt:
+    if not prompt and mode != "replay":
         return JSONResponse({"sessionId": session_id, "mode": mode, "error": "inputText is required"})
 
     try:
@@ -96,6 +96,20 @@ async def invocations(request: Request):
                     plan=plan,
                     session_id=session_id,
                     team_id=body.get("teamId", "default"),
+                    task_arn=body.get("task_arn"),
+                    cluster=body.get("cluster"),
+                    mcp_endpoint=body.get("mcp_endpoint"),
+                ),
+                media_type="application/x-ndjson",
+            )
+        elif mode == "replay":
+            replay_script = body.get("replay_script")
+            if not replay_script:
+                return JSONResponse({"sessionId": session_id, "mode": mode, "error": "replay_script required"})
+            return StreamingResponse(
+                runner.replay_stream(
+                    replay_script=replay_script,
+                    session_id=session_id,
                     task_arn=body.get("task_arn"),
                     cluster=body.get("cluster"),
                     mcp_endpoint=body.get("mcp_endpoint"),
