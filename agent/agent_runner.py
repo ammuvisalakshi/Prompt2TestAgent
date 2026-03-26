@@ -163,22 +163,41 @@ def _extract_replay_script(messages: list) -> list:
     Returns list of {tool, params} dicts for direct replay without LLM.
     """
     script = []
-    for msg in messages:
-        if msg.get("role") != "assistant":
+    logger.info(f"[extract] scanning {len(messages)} messages for playwright tools")
+    for i, msg in enumerate(messages):
+        role = msg.get("role")
+        content = msg.get("content", [])
+        logger.info(f"[extract] msg[{i}] role={role} content_len={len(content)} content_types={[list(b.keys()) if isinstance(b, dict) else type(b).__name__ for b in content]}")
+        if role != "assistant":
             continue
-        for block in msg.get("content", []):
+        for block in content:
             if not isinstance(block, dict):
                 continue
             tool_use = block.get("toolUse")
             if tool_use and isinstance(tool_use, dict):
                 tool_name = tool_use.get("name", "")
-                # Only capture playwright_* tools (skip resolve_config etc)
                 if tool_name.startswith("playwright_"):
                     script.append({
                         "tool": tool_name,
                         "params": tool_use.get("input", {}),
                     })
+    logger.info(f"[extract] found {len(script)} playwright commands")
     return script
+
+
+class _ReplayCapture:
+    """Strands callback_handler that captures playwright tool calls as they execute."""
+    def __init__(self):
+        self.script: list = []
+
+    def __call__(self, **kwargs):
+        # Strands passes current_tool_use when a tool is about to be called
+        tool_use = kwargs.get("current_tool_use") or {}
+        name = tool_use.get("name", "")
+        if name.startswith("playwright_"):
+            entry = {"tool": name, "params": tool_use.get("input", {})}
+            self.script.append(entry)
+            logger.info(f"[capture] recorded {name} params={tool_use.get('input', {})}")
 
 
 def _build_model() -> str:
@@ -433,17 +452,20 @@ class AgentRunner:
             # ── Reuse pre-started session (2-call flow) ───────────────────────
             logger.info(f"[automate] MCP endpoint: {mcp_endpoint}")
             try:
+                capture = _ReplayCapture()
                 with _build_mcp_client(mcp_endpoint) as mcp:
                     tools = mcp.list_tools_sync()
                     agent = Agent(
                         model=_build_model(),
                         system_prompt=AUTOMATE_SYSTEM_PROMPT,
                         tools=tools,
+                        callback_handler=capture,
                     )
                     response = agent(prompt)
                 result = self._parse_plan(str(response))
-                result["replay_script"] = _extract_replay_script(agent.messages)
-                logger.info(f"[automate] captured {len(result['replay_script'])} replay commands")
+                # Prefer callback-captured script; fall back to message scan
+                result["replay_script"] = capture.script if capture.script else _extract_replay_script(agent.messages)
+                logger.info(f"[automate] captured {len(result['replay_script'])} replay commands (callback={len(capture.script)}, messages={len(_extract_replay_script(agent.messages))})")
             finally:
                 # Always stop the task when test finishes (success or error)
                 try:
@@ -474,18 +496,20 @@ class AgentRunner:
             }) + "\n"
 
             # ── Execute the test plan ─────────────────────────────────────────
+            capture = _ReplayCapture()
             with _build_mcp_client(ecs_session.mcp_endpoint) as mcp:
                 tools = mcp.list_tools_sync()
                 agent = Agent(
                     model=_build_model(),
                     system_prompt=AUTOMATE_SYSTEM_PROMPT,
                     tools=tools,
+                    callback_handler=capture,
                 )
                 response = agent(prompt)
 
             result = self._parse_plan(str(response))
-            result["replay_script"] = _extract_replay_script(agent.messages)
-            logger.info(f"[automate] captured {len(result['replay_script'])} replay commands")
+            result["replay_script"] = capture.script if capture.script else _extract_replay_script(agent.messages)
+            logger.info(f"[automate] captured {len(result['replay_script'])} replay commands (callback={len(capture.script)})")
 
             # ── Event 2: test complete — task stops immediately after this ─────
             yield json.dumps({
