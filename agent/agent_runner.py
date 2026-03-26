@@ -501,12 +501,19 @@ class AgentRunner:
                     response = agent(prompt)
                 capture.finalize()
                 result = self._parse_plan(str(response))
-                # Prefer callback-captured script; fall back to message scan
-                from_messages = _extract_replay_script(agent.messages)
+                raw_msgs = agent.messages if hasattr(agent, 'messages') else []
+                n_raw = len(raw_msgs)
+                n_assistant = sum(1 for m in raw_msgs if isinstance(m, dict) and m.get("role") == "assistant")
+                from_messages = _extract_replay_script(raw_msgs)
                 result["replay_script"] = capture.script if capture.script else from_messages
                 n_cb = len(capture.script); n_msg = len(from_messages); n_rs = len(result["replay_script"])
-                logger.info(f"[automate] captured {n_rs} replay commands (callback={n_cb}, messages={n_msg})")
-                result["summary"] = (result.get("summary") or "") + f" [dbg: cb={n_cb} msg={n_msg} rs={n_rs} ver=5044839]"
+                # Log first assistant message structure for debugging
+                first_asst = next((m for m in raw_msgs if isinstance(m, dict) and m.get("role") == "assistant"), None)
+                first_content_keys = [list(b.keys()) if isinstance(b, dict) else type(b).__name__ for b in (first_asst or {}).get("content", [])][:3]
+                logger.info(f"[automate] cb={n_cb} raw={n_raw} asst={n_assistant} msg={n_msg} rs={n_rs} first_content={first_content_keys}")
+                agent_attrs = [a for a in dir(agent) if not a.startswith('_') and 'message' in a.lower()]
+                logger.info(f"[automate] agent message-like attrs: {agent_attrs}")
+                result["summary"] = (result.get("summary") or "") + f" [dbg: cb={n_cb} raw={n_raw} asst={n_assistant} rs={n_rs}]"
             finally:
                 # Always stop the task when test finishes (success or error)
                 try:
