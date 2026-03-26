@@ -70,6 +70,15 @@ async def invocations(request: Request):
                 conversation_history=body.get("conversationHistory", ""),
             )
             return JSONResponse({"sessionId": result["sessionId"], "mode": "plan", "plan": result["plan"]})
+        elif mode == "plan_scenario":
+            result = runner.plan_scenario(
+                prompt=prompt,
+                session_id=session_id,
+                service=body.get("service", ""),
+                env=body.get("env", "dev"),
+                conversation_history=body.get("conversationHistory", ""),
+            )
+            return JSONResponse({"sessionId": result["sessionId"], "mode": "plan_scenario", "text": result["text"]})
         elif mode == "start_session":
             # Spin up ECS browser task and return noVNC URL immediately.
             # Frontend opens live browser popup, then calls automate to run the test.

@@ -28,6 +28,28 @@ from strands import Agent
 
 logger = logging.getLogger(__name__)
 
+PLAN_SCENARIO_SYSTEM_PROMPT = """You are Prompt2Test, an AI test scenario authoring assistant running on Amazon Bedrock AgentCore.
+
+Your job is to enrich test scenarios with real configuration values from SSM and make each step precise and executable.
+
+WORKFLOW:
+1. Call get_service_config immediately to fetch the service's real config parameters from SSM.
+2. Enrich the scenario by replacing any placeholder values (e.g. <URL>, {{BASE_URL}}, YOUR_URL) with actual values.
+3. Make vague steps specific — instead of "navigate to the site", say "navigate to https://example.com/login".
+4. Preserve the original format exactly: Gherkin stays Gherkin, plain English stays plain English.
+5. After presenting the enriched scenario, ask ONE focused follow-up question if anything is still unclear.
+
+CONVERSATION RULES:
+- Never ask vague questions. "Can you provide more details?" is forbidden.
+- Never repeat a question already answered in the conversation history.
+- Keep responses concise: show the scenario, then at most one question.
+
+FINAL GENERATION:
+When the user's message is exactly "generate_final", output ONLY the following — no preamble, no questions:
+Line 1:  SUMMARY: <one-line description of what is being tested>
+Lines 2+: The complete final polished scenario text, nothing else.
+"""
+
 AUTOMATE_SYSTEM_PROMPT = """You are Prompt2Test, an AI test execution agent running on Amazon Bedrock AgentCore.
 
 You have access to Playwright MCP tools to control a real browser. Execute each step of the test plan
@@ -226,6 +248,86 @@ class AgentRunner:
             "sessionId": session_id,
             "mode": "plan",
             "plan": plan,
+        }
+
+    def plan_scenario(self, prompt: str, session_id: str, service: str, env: str,
+                      conversation_history: str = "") -> dict[str, Any]:
+        """
+        Plan Scenario Mode — enrich a pasted test scenario with real SSM config values.
+
+        Returns:
+            { "sessionId": str, "mode": "plan_scenario", "text": str }
+        """
+        import boto3
+
+        if not session_id:
+            session_id = str(uuid.uuid4())
+
+        logger.info(f"[plan_scenario] session={session_id} service={service} env={env} prompt={prompt[:80]}")
+
+        from strands import tool
+
+        region = self.region
+
+        @tool
+        def get_service_config(service_name: str, environment: str) -> str:
+            """
+            Fetch all configuration parameters for a service from SSM Parameter Store.
+            Call this at the start to get the real values needed to enrich the scenario.
+
+            Args:
+                service_name: The service name (e.g. amazon, checkout)
+                environment: The environment (dev, qa, prod)
+            """
+            try:
+                ssm_client = boto3.client('ssm', region_name=region)
+                path = f'/prompt2test/config/{environment}/services/{service_name}'
+                params: dict = {}
+                next_token = None
+                while True:
+                    kwargs: dict = {'Path': path, 'Recursive': True, 'WithDecryption': True}
+                    if next_token:
+                        kwargs['NextToken'] = next_token
+                    resp = ssm_client.get_parameters_by_path(**kwargs)
+                    for p in resp.get('Parameters', []):
+                        key = p['Name'].split('/')[-1]
+                        params[key] = p['Value']
+                    next_token = resp.get('NextToken')
+                    if not next_token:
+                        break
+                if params:
+                    return json.dumps(params)
+                return f'No config found for service "{service_name}" in environment "{environment}". Path: {path}'
+            except Exception as e:
+                logger.error(f"get_service_config error: {e}")
+                return f'Error fetching config: {e}'
+
+        agent = Agent(
+            model=_build_model(),
+            system_prompt=PLAN_SCENARIO_SYSTEM_PROMPT,
+            tools=[get_service_config],
+        )
+
+        if conversation_history:
+            full_prompt = (
+                f"Service: {service}\nEnvironment: {env}\n\n"
+                f"Conversation so far:\n{conversation_history}\n\n"
+                f"Latest message: {prompt}"
+            )
+        else:
+            full_prompt = (
+                f"Service: {service}\nEnvironment: {env}\n\n"
+                f"Scenario to enrich:\n{prompt}"
+            )
+
+        response = agent(full_prompt)
+        raw_text = str(response)
+        logger.info(f"[plan_scenario] response ({len(raw_text)} chars): {raw_text[:500]}")
+
+        return {
+            "sessionId": session_id,
+            "mode": "plan_scenario",
+            "text": raw_text,
         }
 
     def start_session(self, session_id: str, team_id: str) -> dict[str, Any]:
