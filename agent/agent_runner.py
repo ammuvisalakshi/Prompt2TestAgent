@@ -504,7 +504,9 @@ class AgentRunner:
                 # Prefer callback-captured script; fall back to message scan
                 from_messages = _extract_replay_script(agent.messages)
                 result["replay_script"] = capture.script if capture.script else from_messages
-                logger.info(f"[automate] captured {len(result['replay_script'])} replay commands (callback={len(capture.script)}, messages={len(from_messages)})")
+                n_cb = len(capture.script); n_msg = len(from_messages); n_rs = len(result["replay_script"])
+                logger.info(f"[automate] captured {n_rs} replay commands (callback={n_cb}, messages={n_msg})")
+                result["summary"] = (result.get("summary") or "") + f" [dbg: cb={n_cb} msg={n_msg} rs={n_rs} ver=5044839]"
             finally:
                 # Always stop the task when test finishes (success or error)
                 try:
