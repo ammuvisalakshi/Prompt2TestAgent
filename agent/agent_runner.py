@@ -156,43 +156,6 @@ Additional rules:
 """
 
 
-class _CapturingTool:
-    """
-    Transparent proxy around an MCP tool that records every playwright call.
-
-    Strands SDK invokes tools via tool.stream(tool_use, invocation_state)
-    — an async generator — NOT via tool(**kwargs). We intercept stream()
-    to capture the tool name and input before forwarding to the original.
-
-    tool_use is a TypedDict: {"toolUseId": str, "name": str, "input": dict}
-    """
-    def __init__(self, tool, script: list):
-        object.__setattr__(self, '_orig', tool)
-        object.__setattr__(self, '_script', script)
-
-    def __getattr__(self, name):
-        return getattr(object.__getattribute__(self, '_orig'), name)
-
-    async def stream(self, tool_use, invocation_state, **kwargs):
-        orig = object.__getattribute__(self, '_orig')
-        tool_name = getattr(orig, 'tool_name', '')
-        if tool_name.startswith('playwright_'):
-            params = tool_use.get('input', {}) if isinstance(tool_use, dict) else getattr(tool_use, 'input', {})
-            entry = {'tool': tool_name, 'params': params}
-            object.__getattribute__(self, '_script').append(entry)
-            logger.info(f"[capture] {tool_name}({list(params.keys())})")
-        async for event in orig.stream(tool_use, invocation_state, **kwargs):
-            yield event
-
-
-def _wrap_tools(tools: list, script: list) -> list:
-    """Wrap playwright MCP tools with _CapturingTool; leave others unchanged."""
-    result = []
-    for t in tools:
-        name = getattr(t, 'tool_name', '')
-        result.append(_CapturingTool(t, script) if name.startswith('playwright_') else t)
-    return result
-
 
 def _build_model() -> str:
     """Return the Bedrock model ID string for the Strands agent."""
@@ -446,18 +409,14 @@ class AgentRunner:
             # ── Reuse pre-started session (2-call flow) ───────────────────────
             logger.info(f"[automate] MCP endpoint: {mcp_endpoint}")
             try:
-                script = []
                 with _build_mcp_client(mcp_endpoint) as mcp:
-                    tools = _wrap_tools(mcp.list_tools_sync(), script)
                     agent = Agent(
                         model=_build_model(),
                         system_prompt=AUTOMATE_SYSTEM_PROMPT,
-                        tools=tools,
+                        tools=mcp.list_tools_sync(),
                     )
                     response = agent(prompt)
                 result = self._parse_plan(str(response))
-                result["replay_script"] = script
-                logger.info(f"[automate] captured {len(script)} replay commands")
             finally:
                 # Always stop the task when test finishes (success or error)
                 try:
@@ -488,19 +447,15 @@ class AgentRunner:
             }) + "\n"
 
             # ── Execute the test plan ─────────────────────────────────────────
-            script = []
             with _build_mcp_client(ecs_session.mcp_endpoint) as mcp:
-                tools = _wrap_tools(mcp.list_tools_sync(), script)
                 agent = Agent(
                     model=_build_model(),
                     system_prompt=AUTOMATE_SYSTEM_PROMPT,
-                    tools=tools,
+                    tools=mcp.list_tools_sync(),
                 )
                 response = agent(prompt)
 
             result = self._parse_plan(str(response))
-            result["replay_script"] = script
-            logger.info(f"[automate] captured {len(script)} replay commands")
 
             # ── Event 2: test complete — task stops immediately after this ─────
             yield json.dumps({
