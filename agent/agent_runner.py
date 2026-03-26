@@ -158,10 +158,13 @@ Additional rules:
 
 class _CapturingTool:
     """
-    Transparent proxy around an MCP tool that records every call.
-    Uses __getattr__ to forward all attribute access to the original tool,
-    only intercepting __call__ to capture playwright tool invocations.
-    This works regardless of Strands SDK version internals.
+    Transparent proxy around an MCP tool that records every playwright call.
+
+    Strands SDK invokes tools via tool.stream(tool_use, invocation_state)
+    — an async generator — NOT via tool(**kwargs). We intercept stream()
+    to capture the tool name and input before forwarding to the original.
+
+    tool_use is a TypedDict: {"toolUseId": str, "name": str, "input": dict}
     """
     def __init__(self, tool, script: list):
         object.__setattr__(self, '_orig', tool)
@@ -170,14 +173,16 @@ class _CapturingTool:
     def __getattr__(self, name):
         return getattr(object.__getattribute__(self, '_orig'), name)
 
-    def __call__(self, **kwargs):
+    async def stream(self, tool_use, invocation_state, **kwargs):
         orig = object.__getattribute__(self, '_orig')
         tool_name = getattr(orig, 'tool_name', '')
         if tool_name.startswith('playwright_'):
-            entry = {'tool': tool_name, 'params': kwargs}
+            params = tool_use.get('input', {}) if isinstance(tool_use, dict) else getattr(tool_use, 'input', {})
+            entry = {'tool': tool_name, 'params': params}
             object.__getattribute__(self, '_script').append(entry)
-            logger.info(f"[capture] {tool_name}({list(kwargs.keys())})")
-        return orig(**kwargs)
+            logger.info(f"[capture] {tool_name}({list(params.keys())})")
+        async for event in orig.stream(tool_use, invocation_state, **kwargs):
+            yield event
 
 
 def _wrap_tools(tools: list, script: list) -> list:
