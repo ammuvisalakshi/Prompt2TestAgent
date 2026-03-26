@@ -156,85 +156,37 @@ Additional rules:
 """
 
 
-def _extract_replay_script(messages: list) -> list:
+class _CapturingTool:
     """
-    Extract all Playwright MCP tool calls from Strands agent message history.
-    Strands uses Bedrock Converse API format: toolUse blocks inside assistant messages.
-    Returns list of {tool, params} dicts for direct replay without LLM.
+    Transparent proxy around an MCP tool that records every call.
+    Uses __getattr__ to forward all attribute access to the original tool,
+    only intercepting __call__ to capture playwright tool invocations.
+    This works regardless of Strands SDK version internals.
     """
-    script = []
-    logger.info(f"[extract] scanning {len(messages)} messages for playwright tools")
-    for i, msg in enumerate(messages):
-        role = msg.get("role")
-        content = msg.get("content", [])
-        logger.info(f"[extract] msg[{i}] role={role} content_len={len(content)} content_types={[list(b.keys()) if isinstance(b, dict) else type(b).__name__ for b in content]}")
-        if role != "assistant":
-            continue
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            # Strands may use camelCase (toolUse) or snake_case (tool_use)
-            tool_use = block.get("toolUse") or block.get("tool_use")
-            if tool_use and isinstance(tool_use, dict):
-                tool_name = tool_use.get("name", "")
-                if tool_name.startswith("playwright_"):
-                    raw = tool_use.get("input", {})
-                    if isinstance(raw, str):
-                        try:
-                            raw = json.loads(raw) if raw else {}
-                        except Exception:
-                            raw = {}
-                    script.append({"tool": tool_name, "params": raw})
-    logger.info(f"[extract] found {len(script)} playwright commands")
-    return script
+    def __init__(self, tool, script: list):
+        object.__setattr__(self, '_orig', tool)
+        object.__setattr__(self, '_script', script)
 
-
-class _ReplayCapture:
-    """
-    Strands callback_handler that captures playwright tool calls.
-    Strands streams tool input as an accumulating JSON string, calling the handler
-    multiple times per tool. We track by toolUseId and finalize on tool change.
-    """
-    def __init__(self):
-        self.script: list = []
-        self._cur_id: str = ""
-        self._cur_name: str = ""
-        self._cur_input = None  # str (accumulating) or dict (complete)
-
-    def _flush(self):
-        if self._cur_id and self._cur_name.startswith("playwright_"):
-            params = self._cur_input or {}
-            if isinstance(params, str):
-                try:
-                    params = json.loads(params) if params else {}
-                except Exception:
-                    params = {}
-            self.script.append({"tool": self._cur_name, "params": params})
-            logger.info(f"[capture] flushed {self._cur_name} params={params}")
-        self._cur_id = self._cur_name = ""
-        self._cur_input = None
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, '_orig'), name)
 
     def __call__(self, **kwargs):
-        tool_use = kwargs.get("current_tool_use") or {}
-        tool_id = tool_use.get("toolUseId", "")
-        name = tool_use.get("name", "")
-        if not tool_id:
-            return
-        if tool_id != self._cur_id:
-            self._flush()
-            self._cur_id = tool_id
-            self._cur_name = name
-            self._cur_input = tool_use.get("input")
-        else:
-            if name:
-                self._cur_name = name
-            inp = tool_use.get("input")
-            if inp is not None:
-                self._cur_input = inp
+        orig = object.__getattribute__(self, '_orig')
+        tool_name = getattr(orig, 'tool_name', '')
+        if tool_name.startswith('playwright_'):
+            entry = {'tool': tool_name, 'params': kwargs}
+            object.__getattribute__(self, '_script').append(entry)
+            logger.info(f"[capture] {tool_name}({list(kwargs.keys())})")
+        return orig(**kwargs)
 
-    def finalize(self):
-        """Flush the last in-flight tool after the agent completes."""
-        self._flush()
+
+def _wrap_tools(tools: list, script: list) -> list:
+    """Wrap playwright MCP tools with _CapturingTool; leave others unchanged."""
+    result = []
+    for t in tools:
+        name = getattr(t, 'tool_name', '')
+        result.append(_CapturingTool(t, script) if name.startswith('playwright_') else t)
+    return result
 
 
 def _build_model() -> str:
@@ -489,31 +441,18 @@ class AgentRunner:
             # ── Reuse pre-started session (2-call flow) ───────────────────────
             logger.info(f"[automate] MCP endpoint: {mcp_endpoint}")
             try:
-                capture = _ReplayCapture()
+                script = []
                 with _build_mcp_client(mcp_endpoint) as mcp:
-                    tools = mcp.list_tools_sync()
+                    tools = _wrap_tools(mcp.list_tools_sync(), script)
                     agent = Agent(
                         model=_build_model(),
                         system_prompt=AUTOMATE_SYSTEM_PROMPT,
                         tools=tools,
-                        callback_handler=capture,
                     )
                     response = agent(prompt)
-                capture.finalize()
                 result = self._parse_plan(str(response))
-                raw_msgs = agent.messages if hasattr(agent, 'messages') else []
-                n_raw = len(raw_msgs)
-                n_assistant = sum(1 for m in raw_msgs if isinstance(m, dict) and m.get("role") == "assistant")
-                from_messages = _extract_replay_script(raw_msgs)
-                result["replay_script"] = capture.script if capture.script else from_messages
-                n_cb = len(capture.script); n_msg = len(from_messages); n_rs = len(result["replay_script"])
-                # Log first assistant message structure for debugging
-                first_asst = next((m for m in raw_msgs if isinstance(m, dict) and m.get("role") == "assistant"), None)
-                first_content_keys = [list(b.keys()) if isinstance(b, dict) else type(b).__name__ for b in (first_asst or {}).get("content", [])][:3]
-                logger.info(f"[automate] cb={n_cb} raw={n_raw} asst={n_assistant} msg={n_msg} rs={n_rs} first_content={first_content_keys}")
-                agent_attrs = [a for a in dir(agent) if not a.startswith('_') and 'message' in a.lower()]
-                logger.info(f"[automate] agent message-like attrs: {agent_attrs}")
-                result["summary"] = (result.get("summary") or "") + f" [dbg: cb={n_cb} raw={n_raw} asst={n_assistant} rs={n_rs}]"
+                result["replay_script"] = script
+                logger.info(f"[automate] captured {len(script)} replay commands")
             finally:
                 # Always stop the task when test finishes (success or error)
                 try:
@@ -544,22 +483,19 @@ class AgentRunner:
             }) + "\n"
 
             # ── Execute the test plan ─────────────────────────────────────────
-            capture = _ReplayCapture()
+            script = []
             with _build_mcp_client(ecs_session.mcp_endpoint) as mcp:
-                tools = mcp.list_tools_sync()
+                tools = _wrap_tools(mcp.list_tools_sync(), script)
                 agent = Agent(
                     model=_build_model(),
                     system_prompt=AUTOMATE_SYSTEM_PROMPT,
                     tools=tools,
-                    callback_handler=capture,
                 )
                 response = agent(prompt)
 
-            capture.finalize()
             result = self._parse_plan(str(response))
-            from_messages = _extract_replay_script(agent.messages)
-            result["replay_script"] = capture.script if capture.script else from_messages
-            logger.info(f"[automate] captured {len(result['replay_script'])} replay commands (callback={len(capture.script)}, messages={len(from_messages)})")
+            result["replay_script"] = script
+            logger.info(f"[automate] captured {len(script)} replay commands")
 
             # ── Event 2: test complete — task stops immediately after this ─────
             yield json.dumps({
