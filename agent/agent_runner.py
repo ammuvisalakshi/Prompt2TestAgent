@@ -173,31 +173,68 @@ def _extract_replay_script(messages: list) -> list:
         for block in content:
             if not isinstance(block, dict):
                 continue
-            tool_use = block.get("toolUse")
+            # Strands may use camelCase (toolUse) or snake_case (tool_use)
+            tool_use = block.get("toolUse") or block.get("tool_use")
             if tool_use and isinstance(tool_use, dict):
                 tool_name = tool_use.get("name", "")
                 if tool_name.startswith("playwright_"):
-                    script.append({
-                        "tool": tool_name,
-                        "params": tool_use.get("input", {}),
-                    })
+                    raw = tool_use.get("input", {})
+                    if isinstance(raw, str):
+                        try:
+                            raw = json.loads(raw) if raw else {}
+                        except Exception:
+                            raw = {}
+                    script.append({"tool": tool_name, "params": raw})
     logger.info(f"[extract] found {len(script)} playwright commands")
     return script
 
 
 class _ReplayCapture:
-    """Strands callback_handler that captures playwright tool calls as they execute."""
+    """
+    Strands callback_handler that captures playwright tool calls.
+    Strands streams tool input as an accumulating JSON string, calling the handler
+    multiple times per tool. We track by toolUseId and finalize on tool change.
+    """
     def __init__(self):
         self.script: list = []
+        self._cur_id: str = ""
+        self._cur_name: str = ""
+        self._cur_input = None  # str (accumulating) or dict (complete)
+
+    def _flush(self):
+        if self._cur_id and self._cur_name.startswith("playwright_"):
+            params = self._cur_input or {}
+            if isinstance(params, str):
+                try:
+                    params = json.loads(params) if params else {}
+                except Exception:
+                    params = {}
+            self.script.append({"tool": self._cur_name, "params": params})
+            logger.info(f"[capture] flushed {self._cur_name} params={params}")
+        self._cur_id = self._cur_name = ""
+        self._cur_input = None
 
     def __call__(self, **kwargs):
-        # Strands passes current_tool_use when a tool is about to be called
         tool_use = kwargs.get("current_tool_use") or {}
+        tool_id = tool_use.get("toolUseId", "")
         name = tool_use.get("name", "")
-        if name.startswith("playwright_"):
-            entry = {"tool": name, "params": tool_use.get("input", {})}
-            self.script.append(entry)
-            logger.info(f"[capture] recorded {name} params={tool_use.get('input', {})}")
+        if not tool_id:
+            return
+        if tool_id != self._cur_id:
+            self._flush()
+            self._cur_id = tool_id
+            self._cur_name = name
+            self._cur_input = tool_use.get("input")
+        else:
+            if name:
+                self._cur_name = name
+            inp = tool_use.get("input")
+            if inp is not None:
+                self._cur_input = inp
+
+    def finalize(self):
+        """Flush the last in-flight tool after the agent completes."""
+        self._flush()
 
 
 def _build_model() -> str:
@@ -462,10 +499,12 @@ class AgentRunner:
                         callback_handler=capture,
                     )
                     response = agent(prompt)
+                capture.finalize()
                 result = self._parse_plan(str(response))
                 # Prefer callback-captured script; fall back to message scan
-                result["replay_script"] = capture.script if capture.script else _extract_replay_script(agent.messages)
-                logger.info(f"[automate] captured {len(result['replay_script'])} replay commands (callback={len(capture.script)}, messages={len(_extract_replay_script(agent.messages))})")
+                from_messages = _extract_replay_script(agent.messages)
+                result["replay_script"] = capture.script if capture.script else from_messages
+                logger.info(f"[automate] captured {len(result['replay_script'])} replay commands (callback={len(capture.script)}, messages={len(from_messages)})")
             finally:
                 # Always stop the task when test finishes (success or error)
                 try:
@@ -507,9 +546,11 @@ class AgentRunner:
                 )
                 response = agent(prompt)
 
+            capture.finalize()
             result = self._parse_plan(str(response))
-            result["replay_script"] = capture.script if capture.script else _extract_replay_script(agent.messages)
-            logger.info(f"[automate] captured {len(result['replay_script'])} replay commands (callback={len(capture.script)})")
+            from_messages = _extract_replay_script(agent.messages)
+            result["replay_script"] = capture.script if capture.script else from_messages
+            logger.info(f"[automate] captured {len(result['replay_script'])} replay commands (callback={len(capture.script)}, messages={len(from_messages)})")
 
             # ── Event 2: test complete — task stops immediately after this ─────
             yield json.dumps({
