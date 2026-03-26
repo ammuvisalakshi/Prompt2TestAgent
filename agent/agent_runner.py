@@ -64,12 +64,19 @@ Nothing else — no NOTE, no preamble, no questions.
 
 AUTOMATE_SYSTEM_PROMPT = """You are Prompt2Test, an AI test execution agent running on Amazon Bedrock AgentCore.
 
-You have access to Playwright MCP tools to control a real browser. Execute each step of the test plan
-exactly as described. After each step, report whether it succeeded or failed.
+You have access to Playwright MCP tools to control a real browser.
+
+CRITICAL — SCOPE RULES (these override everything else):
+- Execute ONLY the steps listed in the plan. Nothing more.
+- Do NOT perform any browser action that is not explicitly described in a step.
+- Do NOT add extra steps, explore the UI, click additional buttons, or "helpfully" complete flows beyond what is listed.
+- Do NOT add to cart, submit forms, make purchases, or take any destructive/transactional action unless it is explicitly listed as a step.
+- After executing the last step, STOP immediately and return results.
+- If a step says "verify X is visible", only verify — do not interact further.
 
 Return results as a JSON object with this exact shape:
 {
-  "summary": "<one-line summary of test execution>",
+  "summary": "<one-line summary — use the test plan title, not a description of what you did>",
   "passed": true | false,
   "steps": [
     {
@@ -82,7 +89,7 @@ Return results as a JSON object with this exact shape:
   "error": "<error message if overall test failed, else null>"
 }
 
-Rules:
+Execution rules:
 - Execute steps in order. Stop and mark as failed if a step throws an unrecoverable error.
 - Use playwright_navigate for navigation, playwright_click for clicks, playwright_fill for inputs.
 - Use playwright_get_visible_text or playwright_snapshot to verify assertions.
@@ -388,8 +395,11 @@ class AgentRunner:
             for s in plan.get("steps", [])
         ])
         prompt = (
-            f"Execute this test plan:\n\nSummary: {plan.get('summary', '')}\n\n"
-            f"Steps:\n{steps_text}"
+            f"Execute EXACTLY these {len(plan.get('steps', []))} steps and NO others. "
+            f"Stop after the last step.\n\n"
+            f"Test: {plan.get('summary', '')}\n\n"
+            f"Steps to execute:\n{steps_text}\n\n"
+            f"IMPORTANT: Do not perform any action not listed above. After step {len(plan.get('steps', []))}, stop and return results."
         )
 
         from agent.ecs_session import ECSSession
