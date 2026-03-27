@@ -411,16 +411,26 @@ class AgentRunner:
             logger.info(f"[automate] MCP endpoint: {mcp_endpoint}")
             result = None
             try:
+                script: list = []
+
+                def _on_event(**kwargs):
+                    tool_name = kwargs.get('tool_name')
+                    if tool_name and isinstance(tool_name, str) and tool_name.startswith('playwright_'):
+                        tool_input = kwargs.get('tool_input') or {}
+                        script.append({'tool': tool_name, 'params': tool_input})
+                        logger.info(f"[capture] {tool_name}({list(tool_input.keys())})")
+
                 with _build_mcp_client(mcp_endpoint) as mcp:
                     agent = Agent(
                         model=_build_model(),
                         system_prompt=AUTOMATE_SYSTEM_PROMPT,
                         tools=mcp.list_tools_sync(),
+                        callback_handler=_on_event,
                     )
                     response = agent(prompt)
                 result = self._parse_plan(str(response))
-                result["replay_script"] = []
-                logger.info(f"[automate] result: passed={result.get('passed')} steps={len(result.get('steps', []))}")
+                result["replay_script"] = script
+                logger.info(f"[automate] passed={result.get('passed')} steps={len(result.get('steps', []))} captured={len(script)}")
             except Exception as exc:
                 logger.error(f"[automate] Error during automation: {exc}", exc_info=True)
                 result = {"passed": False, "summary": "Automation error", "steps": [], "error": str(exc), "replay_script": []}
@@ -455,17 +465,26 @@ class AgentRunner:
 
             # ── Execute the test plan ─────────────────────────────────────────
             script2: list = []
+
+            def _on_event2(**kwargs):
+                tool_name = kwargs.get('tool_name')
+                if tool_name and isinstance(tool_name, str) and tool_name.startswith('playwright_'):
+                    tool_input = kwargs.get('tool_input') or {}
+                    script2.append({'tool': tool_name, 'params': tool_input})
+                    logger.info(f"[capture] {tool_name}({list(tool_input.keys())})")
+
             try:
                 with _build_mcp_client(ecs_session.mcp_endpoint) as mcp:
                     agent = Agent(
                         model=_build_model(),
                         system_prompt=AUTOMATE_SYSTEM_PROMPT,
                         tools=mcp.list_tools_sync(),
+                        callback_handler=_on_event2,
                     )
                     response = agent(prompt)
                 result = self._parse_plan(str(response))
-                result["replay_script"] = []
-                logger.info(f"[automate] result: passed={result.get('passed')} steps={len(result.get('steps', []))}")
+                result["replay_script"] = script2
+                logger.info(f"[automate] passed={result.get('passed')} steps={len(result.get('steps', []))} captured={len(script2)}")
             except Exception as exc:
                 logger.error(f"[automate] Error during automation: {exc}", exc_info=True)
                 result = {"passed": False, "summary": "Automation error", "steps": [], "error": str(exc), "replay_script": []}
