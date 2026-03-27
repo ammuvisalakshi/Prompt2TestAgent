@@ -158,19 +158,28 @@ Additional rules:
 
 
 def _patch_mcp_client(mcp, script: list):
-    """Patch mcp_client.call_tool_async to record every playwright call.
-    This intercepts at the actual network-call level, so it works regardless
-    of how Strands internally invokes tools.
-    """
-    orig = mcp.call_tool_async
+    """Patch MCPClient.call_tool_async at the CLASS level to capture playwright calls.
 
-    async def _recording(tool_use_id, name, arguments=None, **kwargs):
-        if name.startswith('playwright_'):
+    Patches the class (not instance) to avoid __slots__ restrictions.
+    Returns a restore function — MUST be called after the agent finishes.
+    """
+    cls = type(mcp)
+    orig = cls.call_tool_async  # unbound function
+
+    async def _recording(self, tool_use_id, name, arguments=None, **kwargs):
+        if name and name.startswith('playwright_'):
             script.append({'tool': name, 'params': arguments or {}})
             logger.info(f"[capture] {name}({list((arguments or {}).keys())})")
-        return await orig(tool_use_id=tool_use_id, name=name, arguments=arguments, **kwargs)
+        return await orig(self, tool_use_id, name, arguments, **kwargs)
 
-    mcp.call_tool_async = _recording
+    cls.call_tool_async = _recording
+    logger.info(f"[capture] Patched {cls.__name__}.call_tool_async")
+
+    def restore():
+        cls.call_tool_async = orig
+        logger.info(f"[capture] Restored {cls.__name__}.call_tool_async")
+
+    return restore
 
 
 def _build_model() -> str:
@@ -428,16 +437,16 @@ class AgentRunner:
             try:
                 script: list = []
                 with _build_mcp_client(mcp_endpoint) as mcp:
+                    restore = _patch_mcp_client(mcp, script)
                     try:
-                        _patch_mcp_client(mcp, script)
-                    except Exception as patch_err:
-                        logger.warning(f"[automate] MCP patch failed (capture disabled): {patch_err}")
-                    agent = Agent(
-                        model=_build_model(),
-                        system_prompt=AUTOMATE_SYSTEM_PROMPT,
-                        tools=mcp.list_tools_sync(),
-                    )
-                    response = agent(prompt)
+                        agent = Agent(
+                            model=_build_model(),
+                            system_prompt=AUTOMATE_SYSTEM_PROMPT,
+                            tools=mcp.list_tools_sync(),
+                        )
+                        response = agent(prompt)
+                    finally:
+                        restore()
                 result = self._parse_plan(str(response))
                 result["replay_script"] = script
                 logger.info(f"[automate] captured {len(script)} playwright calls")
@@ -477,16 +486,16 @@ class AgentRunner:
             script2: list = []
             try:
                 with _build_mcp_client(ecs_session.mcp_endpoint) as mcp:
+                    restore = _patch_mcp_client(mcp, script2)
                     try:
-                        _patch_mcp_client(mcp, script2)
-                    except Exception as patch_err:
-                        logger.warning(f"[automate] MCP patch failed (capture disabled): {patch_err}")
-                    agent = Agent(
-                        model=_build_model(),
-                        system_prompt=AUTOMATE_SYSTEM_PROMPT,
-                        tools=mcp.list_tools_sync(),
-                    )
-                    response = agent(prompt)
+                        agent = Agent(
+                            model=_build_model(),
+                            system_prompt=AUTOMATE_SYSTEM_PROMPT,
+                            tools=mcp.list_tools_sync(),
+                        )
+                        response = agent(prompt)
+                    finally:
+                        restore()
                 result = self._parse_plan(str(response))
                 result["replay_script"] = script2
                 logger.info(f"[automate] captured {len(script2)} playwright calls")
