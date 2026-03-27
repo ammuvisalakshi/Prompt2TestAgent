@@ -86,18 +86,8 @@ Return results as a JSON object with this exact shape:
       "detail": "<what happened>"
     }
   ],
-  "error": "<error message if overall test failed, else null>",
-  "playwright_calls": [
-    {"tool": "<exact playwright tool name you called>", "params": {<exact parameters you passed>}},
-    ...
-  ]
+  "error": "<error message if overall test failed, else null>"
 }
-
-The playwright_calls array MUST contain every playwright tool call you made, in order, with the exact tool name and parameters. Example entries:
-  {"tool": "playwright_navigate", "params": {"url": "https://amazon.com"}}
-  {"tool": "playwright_fill", "params": {"selector": "#twotabsearchtextbox", "value": "iPhone 17 pro"}}
-  {"tool": "playwright_click", "params": {"selector": "input[type=submit]"}}
-  {"tool": "playwright_snapshot", "params": {}}
 
 Execution rules:
 - Execute steps in order. Stop and mark as failed if a step throws an unrecoverable error.
@@ -429,9 +419,8 @@ class AgentRunner:
                     )
                     response = agent(prompt)
                 result = self._parse_plan(str(response))
-                playwright_calls = result.pop("playwright_calls", [])
-                result["replay_script"] = playwright_calls
-                logger.info(f"[automate] captured {len(playwright_calls)} playwright calls from LLM response")
+                result["replay_script"] = []
+                logger.info(f"[automate] result: passed={result.get('passed')} steps={len(result.get('steps', []))}")
             except Exception as exc:
                 logger.error(f"[automate] Error during automation: {exc}", exc_info=True)
                 result = {"passed": False, "summary": "Automation error", "steps": [], "error": str(exc), "replay_script": []}
@@ -475,9 +464,8 @@ class AgentRunner:
                     )
                     response = agent(prompt)
                 result = self._parse_plan(str(response))
-                playwright_calls = result.pop("playwright_calls", [])
-                result["replay_script"] = playwright_calls
-                logger.info(f"[automate] captured {len(playwright_calls)} playwright calls from LLM response")
+                result["replay_script"] = []
+                logger.info(f"[automate] result: passed={result.get('passed')} steps={len(result.get('steps', []))}")
             except Exception as exc:
                 logger.error(f"[automate] Error during automation: {exc}", exc_info=True)
                 result = {"passed": False, "summary": "Automation error", "steps": [], "error": str(exc), "replay_script": []}
