@@ -588,31 +588,72 @@ class AgentRunner:
 
         from agent.ecs_session import ECSSession
 
-        def _run_replay(mcp):
-            tools = mcp.list_tools_sync()
-            tools_by_name = {t.tool_name: t for t in tools}
+        async def _replay_async(endpoint: str) -> tuple[list, bool]:
+            """
+            Call each replay tool via raw MCP ClientSession.call_tool().
+            Strands tool objects (from list_tools_sync) are not directly callable
+            outside an agent context — raw ClientSession.call_tool() is the
+            correct way to invoke MCP tools directly, same pattern used in
+            ecs_session._prewarm_browser_async.
+            """
+            from mcp.client.sse import sse_client
+            from mcp import ClientSession
+            from urllib.parse import urlparse
+
+            parsed = urlparse(endpoint)
+            port = parsed.port or 3000
+            sse_url = endpoint.rstrip("/") + "/sse"
+            host_header = f"localhost:{port}"
+
             steps = []
             failed = False
-            for i, cmd in enumerate(replay_script):
-                tool_fn = tools_by_name.get(cmd["tool"])
-                if not tool_fn:
-                    logger.warning(f"[replay] unknown tool: {cmd['tool']}, skipping")
-                    continue
-                try:
-                    logger.info(f"[replay] step {i+1}: {cmd['tool']} params={str(cmd['params'])[:120]}")
-                    tool_fn(**cmd["params"])
-                    steps.append({"stepNumber": i + 1, "tool": cmd["tool"], "status": "passed"})
-                except Exception as exc:
-                    logger.error(f"[replay] step {i+1} FAILED: {exc}")
-                    steps.append({"stepNumber": i + 1, "tool": cmd["tool"], "status": "failed", "error": str(exc)})
-                    failed = True
-                    break
+            async with sse_client(sse_url, headers={"Host": host_header}) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    for i, cmd in enumerate(replay_script):
+                        tool_name = cmd["tool"]
+                        params = cmd.get("params") or {}
+                        try:
+                            logger.info(f"[replay] step {i+1}: {tool_name} params={str(params)[:120]}")
+                            await session.call_tool(tool_name, params)
+                            steps.append({"stepNumber": i + 1, "tool": tool_name, "status": "passed"})
+                        except Exception as exc:
+                            logger.error(f"[replay] step {i+1} FAILED: {exc}")
+                            steps.append({"stepNumber": i + 1, "tool": tool_name, "status": "failed", "error": str(exc)})
+                            failed = True
+                            break
             return steps, not failed
+
+        def _run_replay_sync(endpoint: str) -> tuple[list, bool]:
+            """Run async replay in a dedicated thread to avoid event loop conflicts."""
+            import asyncio
+            import threading
+
+            result: list = []
+            errors: list = []
+
+            def _run():
+                try:
+                    result.append(asyncio.run(_replay_async(endpoint)))
+                except Exception as exc:
+                    errors.append(exc)
+
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+            t.join(timeout=180)
+
+            if errors:
+                raise errors[0]
+            if not result:
+                raise RuntimeError("Replay timed out after 180s")
+            return result[0]
 
         if mcp_endpoint:
             try:
-                with _build_mcp_client(mcp_endpoint) as mcp:
-                    steps, passed = _run_replay(mcp)
+                steps, passed = _run_replay_sync(mcp_endpoint)
+            except Exception as exc:
+                logger.error(f"[replay] Error: {exc}", exc_info=True)
+                steps, passed = [], False
             finally:
                 if task_arn and cluster:
                     try:
@@ -638,8 +679,11 @@ class AgentRunner:
         # Spin up new ECS session if no existing session provided
         with ECSSession(region=self.region) as ecs_session:
             yield json.dumps({"event": "session_ready", "novnc_url": ecs_session.novnc_url}) + "\n"
-            with _build_mcp_client(ecs_session.mcp_endpoint) as mcp:
-                steps, passed = _run_replay(mcp)
+            try:
+                steps, passed = _run_replay_sync(ecs_session.mcp_endpoint)
+            except Exception as exc:
+                logger.error(f"[replay] Error: {exc}", exc_info=True)
+                steps, passed = [], False
 
         yield json.dumps({
             "event": "complete",
