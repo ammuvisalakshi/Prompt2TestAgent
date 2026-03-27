@@ -86,8 +86,18 @@ Return results as a JSON object with this exact shape:
       "detail": "<what happened>"
     }
   ],
-  "error": "<error message if overall test failed, else null>"
+  "error": "<error message if overall test failed, else null>",
+  "playwright_calls": [
+    {"tool": "<exact playwright tool name you called>", "params": {<exact parameters you passed>}},
+    ...
+  ]
 }
+
+The playwright_calls array MUST contain every playwright tool call you made, in order, with the exact tool name and parameters. Example entries:
+  {"tool": "playwright_navigate", "params": {"url": "https://amazon.com"}}
+  {"tool": "playwright_fill", "params": {"selector": "#twotabsearchtextbox", "value": "iPhone 17 pro"}}
+  {"tool": "playwright_click", "params": {"selector": "input[type=submit]"}}
+  {"tool": "playwright_snapshot", "params": {}}
 
 Execution rules:
 - Execute steps in order. Stop and mark as failed if a step throws an unrecoverable error.
@@ -156,31 +166,6 @@ Additional rules:
 """
 
 
-
-class _CapturingTool:
-    """Proxy that records playwright MCP calls for LLM-free replay.
-    Strands calls tool.stream(tool_use, invocation_state) — an async generator.
-    tool_use is a TypedDict: {"toolUseId": str, "name": str, "input": dict}
-    """
-    def __init__(self, tool, script: list):
-        object.__setattr__(self, '_orig', tool)
-        object.__setattr__(self, '_script', script)
-
-    def __getattr__(self, name):
-        return getattr(object.__getattribute__(self, '_orig'), name)
-
-    async def stream(self, tool_use, invocation_state, **kwargs):
-        orig = object.__getattribute__(self, '_orig')
-        params = tool_use.get('input', {}) if isinstance(tool_use, dict) else getattr(tool_use, 'input', {})
-        object.__getattribute__(self, '_script').append({'tool': orig.tool_name, 'params': params})
-        logger.info(f"[capture] {orig.tool_name}({list(params.keys())})")
-        async for event in orig.stream(tool_use, invocation_state, **kwargs):
-            yield event
-
-
-def _wrap_tools(tools: list, script: list) -> list:
-    """Wrap playwright MCP tools with _CapturingTool; leave others unchanged."""
-    return [_CapturingTool(t, script) if getattr(t, 'tool_name', '').startswith('playwright_') else t for t in tools]
 
 
 def _build_model() -> str:
@@ -436,17 +421,17 @@ class AgentRunner:
             logger.info(f"[automate] MCP endpoint: {mcp_endpoint}")
             result = None
             try:
-                script: list = []
                 with _build_mcp_client(mcp_endpoint) as mcp:
                     agent = Agent(
                         model=_build_model(),
                         system_prompt=AUTOMATE_SYSTEM_PROMPT,
-                        tools=_wrap_tools(mcp.list_tools_sync(), script),
+                        tools=mcp.list_tools_sync(),
                     )
                     response = agent(prompt)
                 result = self._parse_plan(str(response))
-                result["replay_script"] = script
-                logger.info(f"[automate] captured {len(script)} playwright calls")
+                playwright_calls = result.pop("playwright_calls", [])
+                result["replay_script"] = playwright_calls
+                logger.info(f"[automate] captured {len(playwright_calls)} playwright calls from LLM response")
             except Exception as exc:
                 logger.error(f"[automate] Error during automation: {exc}", exc_info=True)
                 result = {"passed": False, "summary": "Automation error", "steps": [], "error": str(exc), "replay_script": []}
@@ -486,12 +471,13 @@ class AgentRunner:
                     agent = Agent(
                         model=_build_model(),
                         system_prompt=AUTOMATE_SYSTEM_PROMPT,
-                        tools=_wrap_tools(mcp.list_tools_sync(), script2),
+                        tools=mcp.list_tools_sync(),
                     )
                     response = agent(prompt)
                 result = self._parse_plan(str(response))
-                result["replay_script"] = script2
-                logger.info(f"[automate] captured {len(script2)} playwright calls")
+                playwright_calls = result.pop("playwright_calls", [])
+                result["replay_script"] = playwright_calls
+                logger.info(f"[automate] captured {len(playwright_calls)} playwright calls from LLM response")
             except Exception as exc:
                 logger.error(f"[automate] Error during automation: {exc}", exc_info=True)
                 result = {"passed": False, "summary": "Automation error", "steps": [], "error": str(exc), "replay_script": []}
