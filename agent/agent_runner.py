@@ -573,6 +573,5 @@ class AgentRunner:
                 return json.loads(text[start:end + 1])
             except json.JSONDecodeError:
                 pass
-        # Conversational response — log and return raw so UI can display it as chat
-        logger.error(f"[parse_plan] non-JSON response (first 500): {text[:500]}")
-        return {"summary": f"[raw] {text[:300]}", "raw": text, "steps": []}
+        # Conversational response — return raw so UI can display it as chat
+        return {"summary": "Plan generated", "raw": text, "steps": []}
