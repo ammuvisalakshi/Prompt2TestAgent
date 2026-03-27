@@ -83,11 +83,14 @@ Return results as a JSON object with this exact shape:
       "stepNumber": 1,
       "action": "<action label>",
       "status": "passed | failed | skipped",
-      "detail": "<what happened>"
+      "detail": "<what happened>",
+      "playwright_calls": [{"tool": "<playwright tool name>", "params": {<arguments you passed>}}]
     }
   ],
   "error": "<error message if overall test failed, else null>"
 }
+
+For each step, "playwright_calls" lists every playwright MCP tool you called while executing that step. Example: [{"tool": "playwright_navigate", "params": {"url": "https://amazon.com"}}, {"tool": "playwright_snapshot", "params": {}}]
 
 Execution rules:
 - Execute steps in order. Stop and mark as failed if a step throws an unrecoverable error.
@@ -460,8 +463,12 @@ class AgentRunner:
                                     logger.info(f"[capture] from history: {name}")
 
                 result = self._parse_plan(str(response))
-                result["replay_script"] = script
-                logger.info(f"[automate] passed={result.get('passed')} steps={len(result.get('steps', []))} captured={len(script)}")
+                # Extract playwright_calls from each step; fall back to callback captures
+                step_calls = []
+                for step in result.get('steps', []):
+                    step_calls.extend(step.pop('playwright_calls', []))
+                result["replay_script"] = step_calls if step_calls else script
+                logger.info(f"[automate] passed={result.get('passed')} captured={len(result['replay_script'])}")
             except Exception as exc:
                 logger.error(f"[automate] Error during automation: {exc}", exc_info=True)
                 result = {"passed": False, "summary": "Automation error", "steps": [], "error": str(exc), "replay_script": []}
