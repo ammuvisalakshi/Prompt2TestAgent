@@ -87,6 +87,22 @@ async def invocations(request: Request):
                 team_id=body.get("teamId", "default"),
             )
             return JSONResponse(result)
+        elif mode == "stop_session":
+            # Explicit task cleanup — called by frontend on Stop, success, and failure.
+            task_arn = body.get("task_arn")
+            cluster  = body.get("cluster")
+            if task_arn and cluster:
+                try:
+                    import boto3
+                    ecs = boto3.client("ecs", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+                    ecs.stop_task(cluster=cluster, task=task_arn, reason="Session ended by client")
+                    logger.info(f"[stop_session] Stopped task: {task_arn}")
+                    return JSONResponse({"stopped": True, "task_arn": task_arn})
+                except Exception as e:
+                    logger.warning(f"[stop_session] Could not stop task {task_arn}: {e}")
+                    return JSONResponse({"stopped": False, "error": str(e)})
+            return JSONResponse({"stopped": False, "error": "task_arn and cluster required"})
+
         elif mode == "automate":
             plan = body.get("plan")
             if not plan:
