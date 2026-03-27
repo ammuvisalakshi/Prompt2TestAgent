@@ -463,10 +463,11 @@ class AgentRunner:
                                     logger.info(f"[capture] from history: {name}")
 
                 result = self._parse_plan(str(response))
-                # Extract playwright_calls from each step; fall back to callback captures
+                # Keep playwright_calls inside each step (for grouped display in UI)
+                # Also aggregate into flat replay_script for backward-compat replay
                 step_calls = []
                 for step in result.get('steps', []):
-                    step_calls.extend(step.pop('playwright_calls', []))
+                    step_calls.extend(step.get('playwright_calls', []))
                 result["replay_script"] = step_calls if step_calls else script
                 logger.info(f"[automate] passed={result.get('passed')} captured={len(result['replay_script'])}")
             except Exception as exc:
