@@ -157,29 +157,30 @@ Additional rules:
 
 
 
-def _patch_mcp_client(mcp, script: list):
-    """Patch MCPClient.call_tool_async at the CLASS level to capture playwright calls.
-
-    Patches the class (not instance) to avoid __slots__ restrictions.
-    Returns a restore function — MUST be called after the agent finishes.
+class _CapturingTool:
+    """Proxy that records playwright MCP calls for LLM-free replay.
+    Strands calls tool.stream(tool_use, invocation_state) — an async generator.
+    tool_use is a TypedDict: {"toolUseId": str, "name": str, "input": dict}
     """
-    cls = type(mcp)
-    orig = cls.call_tool_async  # unbound function
+    def __init__(self, tool, script: list):
+        object.__setattr__(self, '_orig', tool)
+        object.__setattr__(self, '_script', script)
 
-    async def _recording(self, tool_use_id, name, arguments=None, **kwargs):
-        if name and name.startswith('playwright_'):
-            script.append({'tool': name, 'params': arguments or {}})
-            logger.info(f"[capture] {name}({list((arguments or {}).keys())})")
-        return await orig(self, tool_use_id, name, arguments, **kwargs)
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, '_orig'), name)
 
-    cls.call_tool_async = _recording
-    logger.info(f"[capture] Patched {cls.__name__}.call_tool_async")
+    async def stream(self, tool_use, invocation_state, **kwargs):
+        orig = object.__getattribute__(self, '_orig')
+        params = tool_use.get('input', {}) if isinstance(tool_use, dict) else getattr(tool_use, 'input', {})
+        object.__getattribute__(self, '_script').append({'tool': orig.tool_name, 'params': params})
+        logger.info(f"[capture] {orig.tool_name}({list(params.keys())})")
+        async for event in orig.stream(tool_use, invocation_state, **kwargs):
+            yield event
 
-    def restore():
-        cls.call_tool_async = orig
-        logger.info(f"[capture] Restored {cls.__name__}.call_tool_async")
 
-    return restore
+def _wrap_tools(tools: list, script: list) -> list:
+    """Wrap playwright MCP tools with _CapturingTool; leave others unchanged."""
+    return [_CapturingTool(t, script) if getattr(t, 'tool_name', '').startswith('playwright_') else t for t in tools]
 
 
 def _build_model() -> str:
@@ -437,16 +438,12 @@ class AgentRunner:
             try:
                 script: list = []
                 with _build_mcp_client(mcp_endpoint) as mcp:
-                    restore = _patch_mcp_client(mcp, script)
-                    try:
-                        agent = Agent(
-                            model=_build_model(),
-                            system_prompt=AUTOMATE_SYSTEM_PROMPT,
-                            tools=mcp.list_tools_sync(),
-                        )
-                        response = agent(prompt)
-                    finally:
-                        restore()
+                    agent = Agent(
+                        model=_build_model(),
+                        system_prompt=AUTOMATE_SYSTEM_PROMPT,
+                        tools=_wrap_tools(mcp.list_tools_sync(), script),
+                    )
+                    response = agent(prompt)
                 result = self._parse_plan(str(response))
                 result["replay_script"] = script
                 logger.info(f"[automate] captured {len(script)} playwright calls")
@@ -486,16 +483,12 @@ class AgentRunner:
             script2: list = []
             try:
                 with _build_mcp_client(ecs_session.mcp_endpoint) as mcp:
-                    restore = _patch_mcp_client(mcp, script2)
-                    try:
-                        agent = Agent(
-                            model=_build_model(),
-                            system_prompt=AUTOMATE_SYSTEM_PROMPT,
-                            tools=mcp.list_tools_sync(),
-                        )
-                        response = agent(prompt)
-                    finally:
-                        restore()
+                    agent = Agent(
+                        model=_build_model(),
+                        system_prompt=AUTOMATE_SYSTEM_PROMPT,
+                        tools=_wrap_tools(mcp.list_tools_sync(), script2),
+                    )
+                    response = agent(prompt)
                 result = self._parse_plan(str(response))
                 result["replay_script"] = script2
                 logger.info(f"[automate] captured {len(script2)} playwright calls")
