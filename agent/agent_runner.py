@@ -157,29 +157,20 @@ Additional rules:
 
 
 
-class _CapturingTool:
-    """Proxy that records playwright MCP calls for LLM-free replay.
-    Strands calls tool.stream(tool_use, invocation_state) — an async generator.
-    tool_use is a TypedDict: {"toolUseId": str, "name": str, "input": dict}
+def _patch_mcp_client(mcp, script: list):
+    """Patch mcp_client.call_tool_async to record every playwright call.
+    This intercepts at the actual network-call level, so it works regardless
+    of how Strands internally invokes tools.
     """
-    def __init__(self, tool, script: list):
-        object.__setattr__(self, '_orig', tool)
-        object.__setattr__(self, '_script', script)
+    orig = mcp.call_tool_async
 
-    def __getattr__(self, name):
-        return getattr(object.__getattribute__(self, '_orig'), name)
+    async def _recording(tool_use_id, name, arguments=None, **kwargs):
+        if name.startswith('playwright_'):
+            script.append({'tool': name, 'params': arguments or {}})
+            logger.info(f"[capture] {name}({list((arguments or {}).keys())})")
+        return await orig(tool_use_id=tool_use_id, name=name, arguments=arguments, **kwargs)
 
-    async def stream(self, tool_use, invocation_state, **kwargs):
-        orig = object.__getattribute__(self, '_orig')
-        params = tool_use.get('input', {}) if isinstance(tool_use, dict) else getattr(tool_use, 'input', {})
-        object.__getattribute__(self, '_script').append({'tool': orig.tool_name, 'params': params})
-        logger.info(f"[capture] {orig.tool_name}({list(params.keys())})")
-        async for event in orig.stream(tool_use, invocation_state, **kwargs):
-            yield event
-
-
-def _wrap_tools(tools: list, script: list) -> list:
-    return [_CapturingTool(t, script) if getattr(t, 'tool_name', '').startswith('playwright_') else t for t in tools]
+    mcp.call_tool_async = _recording
 
 
 def _build_model() -> str:
@@ -436,10 +427,11 @@ class AgentRunner:
             try:
                 script: list = []
                 with _build_mcp_client(mcp_endpoint) as mcp:
+                    _patch_mcp_client(mcp, script)
                     agent = Agent(
                         model=_build_model(),
                         system_prompt=AUTOMATE_SYSTEM_PROMPT,
-                        tools=_wrap_tools(mcp.list_tools_sync(), script),
+                        tools=mcp.list_tools_sync(),
                     )
                     response = agent(prompt)
                 result = self._parse_plan(str(response))
@@ -477,10 +469,11 @@ class AgentRunner:
             # ── Execute the test plan ─────────────────────────────────────────
             script2: list = []
             with _build_mcp_client(ecs_session.mcp_endpoint) as mcp:
+                _patch_mcp_client(mcp, script2)
                 agent = Agent(
                     model=_build_model(),
                     system_prompt=AUTOMATE_SYSTEM_PROMPT,
-                    tools=_wrap_tools(mcp.list_tools_sync(), script2),
+                    tools=mcp.list_tools_sync(),
                 )
                 response = agent(prompt)
 
