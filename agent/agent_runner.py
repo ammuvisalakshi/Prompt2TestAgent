@@ -446,6 +446,19 @@ class AgentRunner:
                         callback_handler=_on_event,
                     )
                     response = agent(prompt)
+
+                # Fallback: extract playwright calls from agent message history
+                if not script:
+                    for msg in getattr(agent, 'messages', []):
+                        if not isinstance(msg, dict) or msg.get('role') != 'assistant':
+                            continue
+                        for block in (msg.get('content', []) if isinstance(msg.get('content'), list) else []):
+                            if isinstance(block, dict) and block.get('type') == 'tool_use':
+                                name = block.get('name', '')
+                                if name.startswith('playwright_'):
+                                    script.append({'tool': name, 'params': block.get('input', {})})
+                                    logger.info(f"[capture] from history: {name}")
+
                 result = self._parse_plan(str(response))
                 result["replay_script"] = script
                 logger.info(f"[automate] passed={result.get('passed')} steps={len(result.get('steps', []))} captured={len(script)}")
@@ -516,6 +529,18 @@ class AgentRunner:
                         callback_handler=_on_event2,
                     )
                     response = agent(prompt)
+
+                if not script2:
+                    for msg in getattr(agent, 'messages', []):
+                        if not isinstance(msg, dict) or msg.get('role') != 'assistant':
+                            continue
+                        for block in (msg.get('content', []) if isinstance(msg.get('content'), list) else []):
+                            if isinstance(block, dict) and block.get('type') == 'tool_use':
+                                name = block.get('name', '')
+                                if name.startswith('playwright_'):
+                                    script2.append({'tool': name, 'params': block.get('input', {})})
+                                    logger.info(f"[capture] from history: {name}")
+
                 result = self._parse_plan(str(response))
                 result["replay_script"] = script2
                 logger.info(f"[automate] passed={result.get('passed')} steps={len(result.get('steps', []))} captured={len(script2)}")
