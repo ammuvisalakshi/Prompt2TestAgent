@@ -18,18 +18,25 @@
 
 ## 1. What is this Agent?
 
-Prompt2Test Agent is an AI-powered test authoring agent. It receives a plain-English test description from the UI and uses Claude (via Amazon Bedrock) to generate a structured test execution plan.
+Prompt2Test Agent is an AI-powered test authoring and execution agent. It receives a plain-English test description from the UI, generates a structured test plan, then executes it in a real browser via Playwright MCP — capturing every tool call for replay.
 
 **Example:**
 ```
-User types:  "Test that billing plan shows Enterprise for Acme Corp"
+User types:  "Test that Best Buy search returns MacBook results"
 
-Agent returns:
-  Step 1 → Resolve BASE_URL from SSM
-  Step 2 → Navigate browser to {{BASE_URL}}/billing
-  Step 3 → Wait for .plan-badge element
-  Step 4 → Assert text content equals {{EXPECTED_PLAN}}
-  Step 5 → Take screenshot
+Agent plans:
+  Step 1 → Navigate to bestbuy.com
+  Step 2 → Locate the search box
+  Step 3 → Type "latest MacBook" and submit
+  Step 4 → Assert search results appear
+
+Agent automates (playwright MCP calls captured):
+  playwright_navigate   → { url: "https://www.bestbuy.com" }
+  playwright_snapshot   → {}
+  playwright_fill       → { selector: "input[name=query]", value: "latest MacBook" }
+  playwright_click      → { selector: "button[type=submit]" }
+  playwright_snapshot   → {}
+  → PASSED
 ```
 
 ### Build Phases
@@ -37,35 +44,53 @@ Agent returns:
 | Phase | What it does | Status |
 |---|---|---|
 | **Phase 1 — Plan Mode** | Agent reads prompt → Claude generates test plan → Returns to UI | ✅ Done |
-| **Phase 2 — Automate Mode** | Agent executes plan via Playwright MCP (live browser) | 🔜 Next |
+| **Phase 2 — Automate Mode** | Agent executes plan via Playwright MCP (live browser); captures MCP call log | ✅ Done |
 
 ---
 
 ## 2. Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                   Prompt2TestUI (React)                  │
-│              User types: "Test billing plan"             │
-└──────────────────────┬──────────────────────────────────┘
-                       │  POST /invoke
-                       ▼
-┌─────────────────────────────────────────────────────────┐
-│           Amazon Bedrock AgentCore Runtime               │
-│                                                         │
-│   ┌─────────────────────────────────────────────────┐   │
-│   │          Docker Container (ARM64)               │   │
-│   │                                                 │   │
-│   │  agent/main.py        FastAPI HTTP server       │   │
-│   │       │                                         │   │
-│   │  agent/agent_runner.py  Strands SDK Agent       │   │
-│   │       │                                         │   │
-│   │  Amazon Bedrock    Claude claude-sonnet-4-5     │   │
-│   │       │                                         │   │
-│   │  [Phase 2] Playwright MCP + REST Client MCP     │   │
-│   └─────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                  Prompt2TestUI (React / Amplify)             │
+│  AgentPage: plan + live browser iframe + result display      │
+│  TestCasePage: Plan Steps tab + Automated Steps tab          │
+└──────────────────────────┬──────────────────────────────────┘
+                           │  InvokeAgentRuntime (Bedrock SDK)
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│              Amazon Bedrock AgentCore Runtime                │
+│                                                             │
+│   ┌─────────────────────────────────────────────────────┐   │
+│   │            Docker Container (ARM64)                 │   │
+│   │                                                     │   │
+│   │  agent/main.py          FastAPI HTTP server         │   │
+│   │       │  mode: plan / start_session / automate      │   │
+│   │  agent/agent_runner.py  Strands SDK Agent           │   │
+│   │       │                                             │   │
+│   │  Amazon Bedrock   Claude claude-sonnet-4-5          │   │
+│   │       │                                             │   │
+│   │  Playwright MCP (SSE) ──► ECS Fargate sidecar       │   │
+│   │                              Chromium + noVNC        │   │
+│   └─────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+                           │  updateTestCaseSteps / updateReplayScript
+                           ▼
+                    Lambda + Aurora / DynamoDB
+                    (test cases + replay scripts)
 ```
+
+### Three Operation Modes
+
+| Mode | Triggered by | What happens |
+|---|---|---|
+| `plan` | User submits prompt | Claude generates JSON plan (steps + expected results) |
+| `start_session` | User clicks "Save & Automate" | ECS task provisioned; noVNC URL returned to UI |
+| `automate` | Immediately after start_session | Agent runs plan via Playwright MCP; captures every tool call |
+
+### Playwright Call Capture
+
+During `automate` mode, the agent instructs Claude to record every Playwright MCP tool it calls — tool name and all arguments — in the JSON response alongside each plan step. These are aggregated into a `replay_script` and saved to the backend. The UI shows them in the **Automated Steps** tab with full parameter detail.
 
 ---
 
@@ -159,23 +184,63 @@ POST /invoke  → Called with the user's prompt
 **Request format (from UI):**
 ```json
 {
-  "inputText": "Test billing plan shows Enterprise for Acme Corp",
+  "inputText": "Test that Best Buy search returns MacBook results",
   "sessionId": "abc-123",
-  "mode": "plan"
+  "mode": "plan | start_session | automate",
+  "taskId": "<ECS task ID — automate mode only>",
+  "novncUrl": "<noVNC URL — automate mode only>"
 }
 ```
 
-**Response format (to UI):**
+**Response — plan mode:**
 ```json
 {
   "sessionId": "abc-123",
   "mode": "plan",
   "plan": {
-    "summary": "Verify Enterprise billing plan for Acme Corp",
-    "steps": [ ... ],
-    "configNeeded": ["BASE_URL", "EXPECTED_PLAN"],
-    "estimatedTokens": 450,
-    "mcpCalls": 6
+    "summary": "Verify Best Buy search returns MacBook results",
+    "steps": [
+      { "stepNumber": 1, "action": "Navigate to bestbuy.com", "expectedResult": "Homepage loads" }
+    ],
+    "configNeeded": []
+  }
+}
+```
+
+**Response — start_session mode:**
+```json
+{
+  "sessionId": "abc-123",
+  "mode": "start_session",
+  "taskId": "arn:aws:ecs:...:task/...",
+  "novncUrl": "http://<task-ip>:6080/vnc.html"
+}
+```
+
+**Response — automate mode:**
+```json
+{
+  "sessionId": "abc-123",
+  "mode": "automate",
+  "result": {
+    "summary": "Best Buy MacBook search test passed",
+    "passed": true,
+    "steps": [
+      {
+        "stepNumber": 1,
+        "action": "Navigate to bestbuy.com",
+        "status": "passed",
+        "detail": "Homepage loaded",
+        "playwright_calls": [
+          { "tool": "playwright_navigate", "params": { "url": "https://www.bestbuy.com" } }
+        ]
+      }
+    ],
+    "replay_script": [
+      { "tool": "playwright_navigate", "params": { "url": "https://www.bestbuy.com" } },
+      { "tool": "playwright_snapshot", "params": {} }
+    ],
+    "error": null
   }
 }
 ```
@@ -184,21 +249,40 @@ POST /invoke  → Called with the user's prompt
 
 ### agent/agent_runner.py — Strands Agent
 
-The core agent logic. Uses Strands SDK to invoke Claude on Bedrock:
+The core agent logic. Three generators handle the three modes:
 
+**plan_stream** — returns a JSON plan:
 ```python
 agent = Agent(
     model=BedrockModel(model_id="us.anthropic.claude-sonnet-4-5"),
-    system_prompt=SYSTEM_PROMPT,
+    system_prompt=PLAN_SYSTEM_PROMPT,
     tools=[resolve_config, resolve_secret],
 )
-response = agent("Test billing plan shows Enterprise for Acme Corp")
+response = agent(prompt)
+# Returns: { summary, steps: [{stepNumber, action, expectedResult}], configNeeded }
 ```
 
-Strands handles the full tool-calling loop:
+**start_session_stream** — provisions a browser task:
+```python
+# Starts ECS Fargate task (Playwright MCP sidecar with noVNC)
+# Returns: { taskId, novncUrl }
 ```
-Prompt → Claude → calls resolve_config("BASE_URL") → Claude continues → Final plan
+
+**automate_stream** — executes the plan:
+```python
+# Connects to Playwright MCP via SSE on the ECS task
+# System prompt instructs Claude to record playwright_calls per step
+agent = Agent(
+    model=BedrockModel(...),
+    system_prompt=AUTOMATE_SYSTEM_PROMPT,   # includes playwright_calls instruction
+    tools=mcp_tools,                         # playwright MCP tools
+)
+response = agent(plan_json)
+# Returns: { summary, passed, steps: [{..., playwright_calls: [{tool, params}]}],
+#            replay_script: [{tool, params}, ...], error }
 ```
+
+The `replay_script` is the flat ordered list of all Playwright MCP calls — saved to the backend and shown in the UI Automated Steps tab.
 
 ---
 
@@ -223,9 +307,10 @@ Key requirements:
 
 CodeBuild reads this file and:
 1. Logs in to ECR
-2. Builds the Docker image tagged with the git commit SHA
+2. Builds the ARM64 Docker image tagged with the git commit SHA
 3. Also tags it as `:latest`
 4. Pushes both tags to ECR
+5. **Automatically calls `update-agent-runtime`** — no manual step needed after each deploy
 
 ---
 
@@ -460,28 +545,38 @@ In the React UI (`AgentPage.tsx`), add a call to the Bedrock AgentCore API when 
 
 ---
 
-## 10. Phase 2 — Automate Mode
+## 10. Automate Mode — How It Works
 
-Phase 2 wires in the MCP tools so the agent actually executes the plan in a browser.
+Automate mode is fully implemented. The agent connects to a Playwright MCP server running in an ECS Fargate sidecar and executes the test plan in a real browser.
 
-### What changes in Phase 2
-
-| File | Change |
-|---|---|
-| `agent/agent_runner.py` | Enable `_build_mcp_tools_phase2()` |
-| `agent/tools/playwright_mcp.py` | Implement `execute()` method |
-| `agent/tools/rest_client_mcp.py` | Implement `execute()` method |
-| `Dockerfile` | Add Playwright + Chromium + Xvfb |
-| `infra/` | Add ECS sidecar containers for MCP servers |
-
-### Phase 2 Architecture
+### Flow
 
 ```
-AgentCore Container
-  ├── agent (FastAPI + Strands)
-  ├── Playwright MCP sidecar  (port 3001) — headed browser + Xvfb + noVNC
-  └── REST Client MCP sidecar (port 3002) — HTTP client
+UI: "Save & Automate"
+  │
+  ├─► start_session → ECS task started (Playwright MCP + noVNC)
+  │                   noVNC URL returned → embedded in UI iframe
+  │
+  └─► automate     → agent_runner connects to Playwright MCP via SSE
+                     Claude executes each plan step using playwright tools
+                     Every tool call + arguments captured in playwright_calls
+                     Final JSON: { passed, steps[playwright_calls], replay_script }
+                     UI shows live browser; result saved to backend
 ```
+
+### ECS Sidecar Architecture
+
+```
+ECS Fargate Task (ARM64)
+  ├── playwright-mcp server  — MCP protocol over SSE
+  ├── Chromium               — headed browser
+  ├── Xvfb                   — virtual display
+  └── noVNC                  — WebSocket → HTTP live browser URL
+```
+
+### Playwright Call Capture Strategy
+
+The `AUTOMATE_SYSTEM_PROMPT` instructs Claude to include a `playwright_calls` array in each step of its JSON response — listing every MCP tool it called (name + arguments) while executing that step. These are extracted and aggregated into `replay_script` for storage and display.
 
 ---
 
