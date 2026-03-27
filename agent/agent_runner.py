@@ -412,13 +412,31 @@ class AgentRunner:
             result = None
             try:
                 script: list = []
+                seen_ids: set = set()
 
                 def _on_event(**kwargs):
-                    tool_name = kwargs.get('tool_name')
-                    if tool_name and isinstance(tool_name, str) and tool_name.startswith('playwright_'):
-                        tool_input = kwargs.get('tool_input') or {}
-                        script.append({'tool': tool_name, 'params': tool_input})
-                        logger.info(f"[capture] {tool_name}({list(tool_input.keys())})")
+                    # ToolStreamEvent — fires during tool execution, tool_use has complete name+input
+                    tse = kwargs.get('tool_stream_event')
+                    if tse:
+                        tu = tse.get('tool_use') or {}
+                        name = tu.get('name', '') if isinstance(tu, dict) else getattr(tu, 'name', '')
+                        uid = tu.get('toolUseId', '') if isinstance(tu, dict) else getattr(tu, 'toolUseId', '')
+                        inp = (tu.get('input', {}) if isinstance(tu, dict) else getattr(tu, 'input', {})) or {}
+                        if name.startswith('playwright_') and uid and uid not in seen_ids:
+                            seen_ids.add(uid)
+                            script.append({'tool': name, 'params': inp})
+                            logger.info(f"[capture] {name}({list(inp.keys())})")
+                        return
+                    # ToolUseStreamEvent — fires as LLM streams tool input; capture when input non-empty
+                    current = kwargs.get('current_tool_use')
+                    if current and isinstance(current, dict):
+                        name = current.get('name', '')
+                        uid = current.get('toolUseId', '')
+                        inp = current.get('input') or {}
+                        if name.startswith('playwright_') and uid and uid not in seen_ids and inp:
+                            seen_ids.add(uid)
+                            script.append({'tool': name, 'params': inp})
+                            logger.info(f"[capture] {name}({list(inp.keys())})")
 
                 with _build_mcp_client(mcp_endpoint) as mcp:
                     agent = Agent(
@@ -465,13 +483,29 @@ class AgentRunner:
 
             # ── Execute the test plan ─────────────────────────────────────────
             script2: list = []
+            seen_ids2: set = set()
 
             def _on_event2(**kwargs):
-                tool_name = kwargs.get('tool_name')
-                if tool_name and isinstance(tool_name, str) and tool_name.startswith('playwright_'):
-                    tool_input = kwargs.get('tool_input') or {}
-                    script2.append({'tool': tool_name, 'params': tool_input})
-                    logger.info(f"[capture] {tool_name}({list(tool_input.keys())})")
+                tse = kwargs.get('tool_stream_event')
+                if tse:
+                    tu = tse.get('tool_use') or {}
+                    name = tu.get('name', '') if isinstance(tu, dict) else getattr(tu, 'name', '')
+                    uid = tu.get('toolUseId', '') if isinstance(tu, dict) else getattr(tu, 'toolUseId', '')
+                    inp = (tu.get('input', {}) if isinstance(tu, dict) else getattr(tu, 'input', {})) or {}
+                    if name.startswith('playwright_') and uid and uid not in seen_ids2:
+                        seen_ids2.add(uid)
+                        script2.append({'tool': name, 'params': inp})
+                        logger.info(f"[capture] {name}({list(inp.keys())})")
+                    return
+                current = kwargs.get('current_tool_use')
+                if current and isinstance(current, dict):
+                    name = current.get('name', '')
+                    uid = current.get('toolUseId', '')
+                    inp = current.get('input') or {}
+                    if name.startswith('playwright_') and uid and uid not in seen_ids2 and inp:
+                        seen_ids2.add(uid)
+                        script2.append({'tool': name, 'params': inp})
+                        logger.info(f"[capture] {name}({list(inp.keys())})")
 
             try:
                 with _build_mcp_client(ecs_session.mcp_endpoint) as mcp:
