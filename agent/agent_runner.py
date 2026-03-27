@@ -424,10 +424,14 @@ class AgentRunner:
         if task_arn and cluster and mcp_endpoint:
             # ── Reuse pre-started session (2-call flow) ───────────────────────
             logger.info(f"[automate] MCP endpoint: {mcp_endpoint}")
+            result = None
             try:
                 script: list = []
                 with _build_mcp_client(mcp_endpoint) as mcp:
-                    _patch_mcp_client(mcp, script)
+                    try:
+                        _patch_mcp_client(mcp, script)
+                    except Exception as patch_err:
+                        logger.warning(f"[automate] MCP patch failed (capture disabled): {patch_err}")
                     agent = Agent(
                         model=_build_model(),
                         system_prompt=AUTOMATE_SYSTEM_PROMPT,
@@ -437,6 +441,9 @@ class AgentRunner:
                 result = self._parse_plan(str(response))
                 result["replay_script"] = script
                 logger.info(f"[automate] captured {len(script)} playwright calls")
+            except Exception as exc:
+                logger.error(f"[automate] Error during automation: {exc}", exc_info=True)
+                result = {"passed": False, "summary": "Automation error", "steps": [], "error": str(exc), "replay_script": []}
             finally:
                 # Always stop the task when test finishes (success or error)
                 try:
@@ -468,18 +475,24 @@ class AgentRunner:
 
             # ── Execute the test plan ─────────────────────────────────────────
             script2: list = []
-            with _build_mcp_client(ecs_session.mcp_endpoint) as mcp:
-                _patch_mcp_client(mcp, script2)
-                agent = Agent(
-                    model=_build_model(),
-                    system_prompt=AUTOMATE_SYSTEM_PROMPT,
-                    tools=mcp.list_tools_sync(),
-                )
-                response = agent(prompt)
-
-            result = self._parse_plan(str(response))
-            result["replay_script"] = script2
-            logger.info(f"[automate] captured {len(script2)} playwright calls")
+            try:
+                with _build_mcp_client(ecs_session.mcp_endpoint) as mcp:
+                    try:
+                        _patch_mcp_client(mcp, script2)
+                    except Exception as patch_err:
+                        logger.warning(f"[automate] MCP patch failed (capture disabled): {patch_err}")
+                    agent = Agent(
+                        model=_build_model(),
+                        system_prompt=AUTOMATE_SYSTEM_PROMPT,
+                        tools=mcp.list_tools_sync(),
+                    )
+                    response = agent(prompt)
+                result = self._parse_plan(str(response))
+                result["replay_script"] = script2
+                logger.info(f"[automate] captured {len(script2)} playwright calls")
+            except Exception as exc:
+                logger.error(f"[automate] Error during automation: {exc}", exc_info=True)
+                result = {"passed": False, "summary": "Automation error", "steps": [], "error": str(exc), "replay_script": []}
 
             # ── Event 2: test complete — task stops immediately after this ─────
             yield json.dumps({
