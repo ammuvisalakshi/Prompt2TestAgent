@@ -33,7 +33,7 @@ PLAN_SCENARIO_SYSTEM_PROMPT = """You are Prompt2Test, an AI test scenario author
 Your job is to turn test scenarios into structured, executable test steps — each with a clear action and a verifiable expected result.
 
 WORKFLOW:
-1. Call get_service_config immediately to fetch the real config values for the service from SSM.
+1. Call get_service_config immediately to fetch the real config values for the service from DynamoDB.
 2. Parse the scenario into discrete steps. For each step identify:
    - action: exactly what the tester/system does (use real URLs, field names, button labels from config)
    - expected: what should be visible or verifiable after that action
@@ -293,7 +293,7 @@ class AgentRunner:
         }
 
     def plan_scenario(self, prompt: str, session_id: str, service: str, env: str,
-                      conversation_history: str = "") -> dict[str, Any]:
+                      team: str = "", conversation_history: str = "") -> dict[str, Any]:
         """
         Plan Scenario Mode — enrich a pasted test scenario with real SSM config values.
 
@@ -310,11 +310,12 @@ class AgentRunner:
         from strands import tool
 
         region = self.region
+        _team = team
 
         @tool
         def get_service_config(service_name: str, environment: str) -> str:
             """
-            Fetch all configuration parameters for a service from SSM Parameter Store.
+            Fetch all configuration parameters for a service from DynamoDB.
             Call this at the start to get the real values needed to enrich the scenario.
 
             Args:
@@ -322,24 +323,18 @@ class AgentRunner:
                 environment: The environment (dev, qa, prod)
             """
             try:
-                ssm_client = boto3.client('ssm', region_name=region)
-                path = f'/prompt2test/config/{environment}/services/{service_name}'
-                params: dict = {}
-                next_token = None
-                while True:
-                    kwargs: dict = {'Path': path, 'Recursive': True, 'WithDecryption': True}
-                    if next_token:
-                        kwargs['NextToken'] = next_token
-                    resp = ssm_client.get_parameters_by_path(**kwargs)
-                    for p in resp.get('Parameters', []):
-                        key = p['Name'].split('/')[-1]
-                        params[key] = p['Value']
-                    next_token = resp.get('NextToken')
-                    if not next_token:
-                        break
+                import boto3
+                dynamodb = boto3.resource('dynamodb', region_name=region)
+                table = dynamodb.Table('prompt2test-config')
+                pk = f'SERVICE#{_team}#{environment}'
+                resp = table.query(
+                    KeyConditionExpression='pk = :pk AND begins_with(sk, :svc)',
+                    ExpressionAttributeValues={':pk': pk, ':svc': f'{service_name}#'},
+                )
+                params = {item['sk'].split('#', 1)[1]: item['val'] for item in resp.get('Items', [])}
                 if params:
                     return json.dumps(params)
-                return f'No config found for service "{service_name}" in environment "{environment}". Path: {path}'
+                return f'No config found for service "{service_name}" in environment "{environment}" for team "{_team}".'
             except Exception as e:
                 logger.error(f"get_service_config error: {e}")
                 return f'Error fetching config: {e}'

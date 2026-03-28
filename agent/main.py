@@ -76,6 +76,7 @@ async def invocations(request: Request):
                 session_id=session_id,
                 service=body.get("service", ""),
                 env=body.get("env", "dev"),
+                team=body.get("team", ""),
                 conversation_history=body.get("conversationHistory", ""),
             )
             return JSONResponse({"sessionId": result["sessionId"], "mode": "plan_scenario", "text": result["text"]})
